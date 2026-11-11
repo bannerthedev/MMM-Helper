@@ -1,26 +1,31 @@
 require('dotenv').config();
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
-const { Client, GatewayIntentBits } = require('discord.js');
-const { joinVoiceChannel, getVoiceConnection } = require('@discordjs/voice');
+const { Client, GatewayIntentBits, SlashCommandBuilder, MessageFlags } = require('discord.js');
+const { parseMatchText } = require('./matchParser');
 
-const { DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, GUILD_ID, PORT = 3000 } = process.env;
-const ROLES = (process.env.ROLES || '').split(',').filter(Boolean).map(r => r.split(':'));
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates] });
+const { DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, GUILD_ID, BOT_API_KEY, PORT = 3000 } = process.env;
+// ROLES = "Head Caster:123,Caster:456" (highest first). Anyone with none of them is a "Member".
+const ROLES = (process.env.ROLES || '').split(',').filter(Boolean).map(r => r.split(':').map(x => x.trim()));
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.MessageContent] });
+
 const codes = new Map(); // userId -> { code, expires, user }
 const tries = new Map(); // userId -> failed attempts
+const newCode = () => crypto.randomBytes(5).toString('hex').toUpperCase(); // 10 characters
+const roleOf = (member) => { for (const [name, id] of ROLES) if (member.roles.cache.has(id)) return name; return 'Member'; };
 
-const newCode = () => crypto.randomBytes(5).toString('hex').toUpperCase(); // 10 chars
-
-function roleOf(member) {
-  for (const [name, id] of ROLES) if (member.roles.cache.has(id)) return name;
-  return 'Member';
-}
+const needKey = (req, res, next) => {
+  const a = Buffer.from(String(req.headers['x-api-key'] || '')), b = Buffer.from(String(BOT_API_KEY || ''));
+  if (b.length && a.length === b.length && crypto.timingSafeEqual(a, b)) return next();
+  res.status(401).json({ error: 'Bad bot API key.' });
+};
 
 const app = express();
 app.use(express.json());
 
-// Step 1: app sends Discord OAuth code -> bot identifies user, detects role, DMs sign-in code
+// ---------- sign-in: the app sends the Discord OAuth code, the bot DMs a sign-in code ----------
 app.post('/auth/discord', async (req, res) => {
   try {
     const { code, redirectUri } = req.body;
@@ -43,12 +48,12 @@ app.post('/auth/discord', async (req, res) => {
       .catch(() => { throw new Error('dm'); });
     res.json({ userId: me.id, username: user.username });
   } catch (e) {
+    console.error(e);
     res.status(e.message === 'dm' ? 403 : 500).json({ error: e.message === 'dm'
       ? "Couldn't DM you. Turn on DMs from server members and try again." : 'Sign-in failed. Try again.' });
   }
 });
 
-// Step 2: app submits the code
 app.post('/auth/verify', (req, res) => {
   const { userId, code } = req.body;
   const entry = codes.get(userId);
@@ -60,34 +65,144 @@ app.post('/auth/verify', (req, res) => {
   res.json({ user: entry.user });
 });
 
-// ---- Voice channel (timer app commentators overlay) ----
-const needKey = (req, res, next) => (process.env.BOT_API_KEY && req.headers['x-api-key'] === process.env.BOT_API_KEY) ? next() : res.status(401).json({ error: 'Bad bot API key.' });
-let vcOwner = null;
+// ---------- voice channel (commentators overlay) ----------
+// The bot only tells Discord it is "in" the channel (a gateway voice-state update). It opens NO audio connection,
+// so Discord's mandatory DAVE voice encryption (error 4017) does not apply, and no voice libraries are needed.
+let vcOwner = null, vcChannel = null;
+const sendVoiceState = (guild, channelId) =>
+  guild.shard.send({ op: 4, d: { guild_id: guild.id, channel_id: channelId, self_mute: false, self_deaf: true } });
+
 app.post('/vc/join', needKey, async (req, res) => {
   try {
+    const uid = String(req.body.userId);
+    if (vcChannel && vcOwner !== uid) return res.status(409).json({ error: 'The bot is already in use in another voice channel.' });
     const guild = await client.guilds.fetch(GUILD_ID);
-    const existing = getVoiceConnection(guild.id);
-    if (existing && vcOwner !== req.body.userId) return res.status(409).json({ error: 'The bot is already in use in another voice channel.' });
-    const member = await guild.members.fetch(req.body.userId).catch(() => null);
-    const ch = member?.voice?.channel;
+    const ch = guild.voiceStates.cache.get(uid)?.channel;
     if (!ch) return res.status(400).json({ error: 'Join a voice channel in Discord first.' });
-    joinVoiceChannel({ channelId: ch.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: true });
-    vcOwner = req.body.userId;
+    sendVoiceState(guild, ch.id);
+    vcOwner = uid; vcChannel = ch.id;
     res.json({ channel: ch.name });
-  } catch (e) { res.status(500).json({ error: 'Could not join the voice channel.' }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Could not join the voice channel.' }); }
 });
-app.post('/vc/leave', needKey, (req, res) => {
-  const c = getVoiceConnection(GUILD_ID);
-  if (c && vcOwner === req.body.userId) { c.destroy(); vcOwner = null; }
+
+app.post('/vc/leave', needKey, async (req, res) => {
+  try {
+    if (vcChannel && String(req.body.userId) === vcOwner) {
+      sendVoiceState(await client.guilds.fetch(GUILD_ID), null);
+      vcOwner = null; vcChannel = null;
+    }
+  } catch (e) { console.error(e); }
   res.json({ ok: true });
 });
+
 app.get('/vc/members', needKey, async (req, res) => {
-  const c = getVoiceConnection(GUILD_ID);
-  if (!c) return res.status(404).json({ error: 'Not connected.' });
-  const ch = await client.channels.fetch(c.joinConfig.channelId);
+  if (!vcChannel) return res.status(404).json({ error: 'Not connected.' });
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const ch = guild.channels.cache.get(vcChannel);
+  if (!ch) return res.status(404).json({ error: 'Not connected.' });
   res.json({ members: [...ch.members.values()].filter(m => !m.user.bot)
     .map(m => ({ id: m.id, name: m.displayName, avatar: m.displayAvatarURL({ extension: 'png', size: 128 }) })) });
 });
 
-client.once('ready', () => { console.log(`Bot online as ${client.user.tag}`); app.listen(PORT, () => console.log(`API on :${PORT}`)); });
+// ---------- YouTube: the bot holds ONE Google login so casters never sign in to Google ----------
+let ytCache = { token: null, exp: 0 };
+async function ytToken() {
+  if (ytCache.token && Date.now() < ytCache.exp - 60000) return ytCache.token;
+  const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', body: new URLSearchParams({
+    client_id: process.env.GOOGLE_CLIENT_ID, client_secret: process.env.GOOGLE_CLIENT_SECRET,
+    refresh_token: process.env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }) });
+  const j = await r.json();
+  if (!r.ok) throw new Error('Google login failed: ' + (j.error_description || j.error));
+  ytCache = { token: j.access_token, exp: Date.now() + j.expires_in * 1000 };
+  return ytCache.token;
+}
+async function yt(method, endpoint, query, body) {
+  const r = await fetch(`https://www.googleapis.com/youtube/v3/${endpoint}?${new URLSearchParams(query)}`, { method,
+    headers: { Authorization: `Bearer ${await ytToken()}`, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error?.message || 'YouTube request failed');
+  return j;
+}
+const FIXED_DESCRIPTION = 'If you want to join the discord:\nhttps://discord.gg/mmml';
+const tidy = (v, d) => String(v || d).replace(/[<>\n\r]/g, '').trim().slice(0, 30) || d;
+
+app.post('/yt/start', needKey, async (req, res) => {
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const member = await guild.members.fetch(String(req.body.userId)).catch(() => null);
+    if (!member || roleOf(member) === 'Member') return res.status(403).json({ error: 'Only casters can start a stream.' });
+    const title = `${tidy(req.body.team1, 'Team 1')} vs ${tidy(req.body.team2, 'Team 2')} | Monke Monke Monke | ${tidy(req.body.round, 'Bracket Round 1')}`;
+
+    let stream = (await yt('GET', 'liveStreams', { part: 'snippet,cdn', mine: 'true', maxResults: '10' })).items?.[0];
+    if (!stream) stream = await yt('POST', 'liveStreams', { part: 'snippet,cdn' }, { snippet: { title: 'MMM Stream' },
+      cdn: { frameRate: 'variable', ingestionType: 'rtmp', resolution: 'variable' } });
+    const b = await yt('POST', 'liveBroadcasts', { part: 'snippet,status,contentDetails' }, {
+      snippet: { title, description: FIXED_DESCRIPTION, scheduledStartTime: new Date(Date.now() + 60000).toISOString() },
+      status: { privacyStatus: 'public', selfDeclaredMadeForKids: false },
+      contentDetails: { enableAutoStart: true, enableAutoStop: true } });
+    await yt('POST', 'liveBroadcasts/bind', { id: b.id, part: 'id,contentDetails', streamId: stream.id });
+    const tr = await fetch(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${b.id}&uploadType=media`, { method: 'POST',
+      headers: { Authorization: `Bearer ${await ytToken()}`, 'Content-Type': 'image/png' }, body: fs.readFileSync(path.join(__dirname, 'thumbnail.png')) });
+
+    // If the bot is connected to a voice channel, post the live link in that voice channel's text chat
+    if (vcChannel) {
+      const ch = guild.channels.cache.get(vcChannel);
+      if (ch?.send) await ch.send(`🔴 **LIVE:** ${title}\nhttps://www.youtube.com/watch?v=${b.id}`).catch(console.error);
+    }
+    res.json({ title, streamKey: stream.cdn.ingestionInfo.streamName, thumbOk: tr.ok });
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
+});
+
+// ---------- match channel + /line-up (feeds the app's Commentator Tools) ----------
+const norm = (t) => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+const LINEUP_FILE = path.join(__dirname, 'lineups.json');
+const lineups = new Map(); // normalised team name -> { team, players: [] }
+try { for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(LINEUP_FILE, 'utf8')))) lineups.set(k, v); } catch {}
+const saveLineups = () => { try { fs.writeFileSync(LINEUP_FILE, JSON.stringify(Object.fromEntries(lineups))); } catch {} };
+
+// The app asks for the commentators, team names, ref and caster found in MATCH_CHANNEL_ID, plus all saved line-ups.
+app.post('/match/info', needKey, async (req, res) => {
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const member = await guild.members.fetch(String(req.body.userId)).catch(() => null);
+    if (!member || roleOf(member) === 'Member') return res.status(403).json({ error: 'Only casters can use Commentator Tools.' });
+    if (!process.env.MATCH_CHANNEL_ID) return res.status(400).json({ error: 'MATCH_CHANNEL_ID is not set on the bot.' });
+    const ch = await client.channels.fetch(process.env.MATCH_CHANNEL_ID).catch(() => null);
+    if (!ch?.messages) return res.status(500).json({ error: 'The match channel was not found. Check MATCH_CHANNEL_ID and that the bot can see that channel.' });
+    const out = { comm: [], team1: null, team2: null, ref: null, caster: null };
+    const msgs = await ch.messages.fetch({ limit: 50 }); // newest first, so the newest value for each field wins
+    for (const m of msgs.values()) {
+      const embeds = m.embeds.map(e => [e.title, e.description, ...(e.fields || []).map(f => `${f.name}: ${f.value}`)].filter(Boolean).join('\n')).join('\n');
+      parseMatchText(`${m.cleanContent}\n${embeds}`, out);
+    }
+    res.json({ commentators: [out.comm[0] || null, out.comm[1] || null], team1: out.team1, team2: out.team2, ref: out.ref, caster: out.caster,
+      channel: ch.name, lineups: Object.fromEntries([...lineups].map(([k, v]) => [k, v.players])) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Could not read the match channel.' }); }
+});
+
+const lineUpCommand = new SlashCommandBuilder().setName('line-up').setDescription('Set or view the players for a team')
+  .addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true))
+  .addStringOption(o => o.setName('players').setDescription('Players separated by commas (type "clear" to remove). Leave empty to view.'));
+
+client.on('interactionCreate', async (i) => {
+  if (!i.isChatInputCommand() || i.commandName !== 'line-up') return;
+  const team = i.options.getString('team', true).trim().slice(0, 40), raw = i.options.getString('players'), key = norm(team);
+  if (raw === null) {
+    const l = lineups.get(key);
+    return i.reply(l ? { content: `**${l.team}** line-up: ${l.players.join(', ')}` } : { content: `No line-up saved for **${team}** yet.`, flags: MessageFlags.Ephemeral });
+  }
+  if (!i.member || roleOf(i.member) === 'Member') return i.reply({ content: 'Only casters can set a line-up.', flags: MessageFlags.Ephemeral });
+  if (raw.trim().toLowerCase() === 'clear') { lineups.delete(key); saveLineups(); return i.reply(`Cleared the line-up for **${team}**.`); }
+  const players = raw.split(/[,\n]/).map(p => p.trim().slice(0, 30)).filter(Boolean).slice(0, 10);
+  if (!players.length) return i.reply({ content: 'List the players separated by commas.', flags: MessageFlags.Ephemeral });
+  lineups.set(key, { team, players }); saveLineups();
+  i.reply(`Saved the line-up for **${team}**: ${players.join(', ')}`);
+});
+
+client.once('ready', async () => {
+  console.log(`Bot online as ${client.user.tag}`);
+  try { await (await client.guilds.fetch(GUILD_ID)).commands.set([lineUpCommand.toJSON()]); console.log('Slash command /line-up registered'); }
+  catch (e) { console.error('Could not register /line-up:', e.message); }
+  app.listen(PORT, () => console.log(`API on :${PORT}`));
+});
 client.login(DISCORD_TOKEN);
