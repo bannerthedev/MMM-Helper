@@ -1,5 +1,6 @@
 require('dotenv').config();
 const crypto = require('crypto');
+const { Readable } = require('stream');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
@@ -14,7 +15,11 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 const codes = new Map(); // userId -> { code, expires, user }
 const tries = new Map(); // userId -> failed attempts
 const newCode = () => crypto.randomBytes(5).toString('hex').toUpperCase(); // 10 characters
-const roleOf = (member) => { for (const [name, id] of ROLES) if (member.roles.cache.has(id)) return name; return 'Member'; };
+const rolesOf = (member) => ROLES.filter(([name, id]) =>
+  member.roles.cache.has(id) || member.roles.cache.some(r => r.name.trim().toLowerCase() === name.toLowerCase())).map(([name]) => name); // every role they hold, in ROLES order
+const roleOf = (member) => rolesOf(member)[0] || 'Member';
+const hasRole = (member, names) => rolesOf(member).some(r => names.includes(r.toLowerCase()));
+const CASTER = ['caster', 'head caster'], COMMENTATOR = ['commentator', 'head commentator'];
 
 const needKey = (req, res, next) => {
   const a = Buffer.from(String(req.headers['x-api-key'] || '')), b = Buffer.from(String(BOT_API_KEY || ''));
@@ -40,7 +45,9 @@ app.post('/auth/discord', async (req, res) => {
     const member = await guild.members.fetch(me.id).catch(() => null);
     if (!member) return res.status(403).json({ error: 'You need to be in the MMM Discord server to sign in.' });
 
-    const user = { userId: me.id, username: member.displayName || me.username, role: roleOf(member) };
+    console.log(`Sign-in: ${member.displayName} has roles [${rolesOf(member).join(', ')}]`);
+    const user = { userId: me.id, username: member.displayName || me.username, role: roleOf(member), roles: rolesOf(member),
+      avatar: member.displayAvatarURL({ extension: 'png', size: 128 }) };
     const c = newCode();
     codes.set(me.id, { code: c, expires: Date.now() + 5 * 60 * 1000, user });
     tries.delete(me.id);
@@ -130,7 +137,7 @@ app.post('/yt/start', needKey, async (req, res) => {
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
     const member = await guild.members.fetch(String(req.body.userId)).catch(() => null);
-    if (!member || roleOf(member) === 'Member') return res.status(403).json({ error: 'Only casters can start a stream.' });
+    if (!member || !hasRole(member, CASTER)) return res.status(403).json({ error: 'Only casters can start a stream.' });
     const title = `${tidy(req.body.team1, 'Team 1')} vs ${tidy(req.body.team2, 'Team 2')} | Monke Monke Monke | ${tidy(req.body.round, 'Bracket Round 1')}`;
 
     let stream = (await yt('GET', 'liveStreams', { part: 'snippet,cdn', mine: 'true', maxResults: '10' })).items?.[0];
@@ -153,6 +160,36 @@ app.post('/yt/start', needKey, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
+// ---------- app updates: the app asks the bot, the bot reads your latest GitHub release ----------
+// Set GITHUB_REPO (owner/name) and, if the repo is private, GITHUB_TOKEN. The exe is never public.
+let relCache = { at: 0, data: null };
+async function latestRelease() {
+  if (relCache.data && Date.now() - relCache.at < 60000) return relCache.data;
+  if (!process.env.GITHUB_REPO) throw new Error('GITHUB_REPO is not set on the bot.');
+  const r = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPO}/releases/latest`, { headers: ghHeaders('application/vnd.github+json') });
+  if (!r.ok) throw new Error(`Could not read the latest release (${r.status}).`);
+  const j = await r.json();
+  const asset = (j.assets || []).find(a => /\.exe$/i.test(a.name));
+  if (!asset) throw new Error('The latest release has no .exe file attached.');
+  relCache = { at: Date.now(), data: { version: String(j.tag_name).replace(/^v/i, ''), notes: j.body || '', asset } };
+  return relCache.data;
+}
+const ghHeaders = (accept) => ({ Accept: accept, 'User-Agent': 'mmm-bot', ...(process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}) });
+app.get('/update/latest', needKey, async (req, res) => {
+  try { const r = await latestRelease(); res.json({ version: r.version, notes: r.notes }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/update/download', needKey, async (req, res) => {
+  try {
+    const { asset } = await latestRelease();
+    const r = await fetch(asset.url, { headers: ghHeaders('application/octet-stream'), redirect: 'follow' });
+    if (!r.ok) return res.status(500).json({ error: `Could not download the update (${r.status}).` });
+    res.setHeader('Content-Type', 'application/octet-stream');
+    if (asset.size) res.setHeader('Content-Length', asset.size);
+    Readable.fromWeb(r.body).pipe(res);
+  } catch (e) { if (!res.headersSent) res.status(500).json({ error: e.message }); }
+});
+
 // ---------- match channel + /line-up (feeds the app's Commentator Tools) ----------
 const norm = (t) => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
 const LINEUP_FILE = path.join(__dirname, 'lineups.json');
@@ -165,18 +202,22 @@ app.post('/match/info', needKey, async (req, res) => {
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
     const member = await guild.members.fetch(String(req.body.userId)).catch(() => null);
-    if (!member || roleOf(member) === 'Member') return res.status(403).json({ error: 'Only casters can use Commentator Tools.' });
+    if (!member || !hasRole(member, COMMENTATOR)) return res.status(403).json({ error: 'Only commentators can use Commentator Tools.' });
     if (!process.env.MATCH_CHANNEL_ID) return res.status(400).json({ error: 'MATCH_CHANNEL_ID is not set on the bot.' });
     const ch = await client.channels.fetch(process.env.MATCH_CHANNEL_ID).catch(() => null);
     if (!ch?.messages) return res.status(500).json({ error: 'The match channel was not found. Check MATCH_CHANNEL_ID and that the bot can see that channel.' });
     const out = { comm: [], team1: null, team2: null, ref: null, caster: null };
-    const msgs = await ch.messages.fetch({ limit: 50 }); // newest first, so the newest value for each field wins
-    for (const m of msgs.values()) {
+    const msgs = await ch.messages.fetch({ limit: 25 }); // newest first
+    let used = null;
+    for (const m of msgs.values()) { // the LATEST message that contains match details wins
       const embeds = m.embeds.map(e => [e.title, e.description, ...(e.fields || []).map(f => `${f.name}: ${f.value}`)].filter(Boolean).join('\n')).join('\n');
-      parseMatchText(`${m.cleanContent}\n${embeds}`, out);
+      const o = { comm: [], team1: null, team2: null, ref: null, caster: null };
+      parseMatchText(`${m.cleanContent}\n${embeds}`, o);
+      if (o.team1 || o.team2 || o.comm.length || o.ref || o.caster) { Object.assign(out, o); used = m; break; }
     }
+    const sample = used ? null : String(msgs.first()?.cleanContent || '(no text - is Message Content Intent on?)').slice(0, 140);
     res.json({ commentators: [out.comm[0] || null, out.comm[1] || null], team1: out.team1, team2: out.team2, ref: out.ref, caster: out.caster,
-      channel: ch.name, lineups: Object.fromEntries([...lineups].map(([k, v]) => [k, v.players])) });
+      channel: ch.name, found: !!used, sample, lineups: Object.fromEntries([...lineups].map(([k, v]) => [k, v.players])) });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Could not read the match channel.' }); }
 });
 
@@ -191,7 +232,7 @@ client.on('interactionCreate', async (i) => {
     const l = lineups.get(key);
     return i.reply(l ? { content: `**${l.team}** line-up: ${l.players.join(', ')}` } : { content: `No line-up saved for **${team}** yet.`, flags: MessageFlags.Ephemeral });
   }
-  if (!i.member || roleOf(i.member) === 'Member') return i.reply({ content: 'Only casters can set a line-up.', flags: MessageFlags.Ephemeral });
+  if (!i.member || !hasRole(i.member, [...CASTER, ...COMMENTATOR])) return i.reply({ content: 'Only casters and commentators can set a line-up.', flags: MessageFlags.Ephemeral });
   if (raw.trim().toLowerCase() === 'clear') { lineups.delete(key); saveLineups(); return i.reply(`Cleared the line-up for **${team}**.`); }
   const players = raw.split(/[,\n]/).map(p => p.trim().slice(0, 30)).filter(Boolean).slice(0, 10);
   if (!players.length) return i.reply({ content: 'List the players separated by commas.', flags: MessageFlags.Ephemeral });
