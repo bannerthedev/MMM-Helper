@@ -13,5 +13,5 @@ const srv = http.createServer(async (req, res) => {
     client_id: id, client_secret: secret, redirect_uri: redirect, grant_type: 'authorization_code' }) });
   const j = await r.json(); res.end(j.refresh_token ? 'Done. Go back to the terminal.' : 'Failed. See the terminal.');
   console.log(j.refresh_token ? '\nGOOGLE_REFRESH_TOKEN=' + j.refresh_token + '\n' : '\nNo refresh token returned: ' + JSON.stringify(j));
-  srv.close(); process.exit(0);
+  srv.close();
 }).listen(53684, '127.0.0.1');
