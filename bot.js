@@ -1,6 +1,7 @@
 require('dotenv').config();
 const crypto = require('crypto');
 const { Readable } = require('stream');
+const { joinVoiceChannel, entersState, VoiceConnectionStatus } = require('@discordjs/voice');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
@@ -73,11 +74,30 @@ app.post('/auth/verify', (req, res) => {
 });
 
 // ---------- voice channel (commentators overlay) ----------
-// The bot only tells Discord it is "in" the channel (a gateway voice-state update). It opens NO audio connection,
-// so Discord's mandatory DAVE voice encryption (error 4017) does not apply, and no voice libraries are needed.
-let vcOwner = null, vcChannel = null;
+// The bot joins the caster's voice channel so it can see WHO IS TALKING (the blue ring in the overlay).
+// If a full voice connection fails (Discord now requires DAVE encryption), it falls back to just appearing in the
+// channel: the member list still works, but there are no talking rings.
+let vcOwner = null, vcChannel = null, vcConn = null;
+const speaking = new Set();
 const sendVoiceState = (guild, channelId) =>
-  guild.shard.send({ op: 4, d: { guild_id: guild.id, channel_id: channelId, self_mute: false, self_deaf: true } });
+  guild.shard.send({ op: 4, d: { guild_id: guild.id, channel_id: channelId, self_mute: true, self_deaf: false } });
+
+async function connectVoice(guild, ch) {
+  let conn = null;
+  try {
+    conn = joinVoiceChannel({ channelId: ch.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: false, selfMute: true });
+    await entersState(conn, VoiceConnectionStatus.Ready, 12000);
+    conn.receiver.speaking.on('start', (id) => speaking.add(id));
+    conn.receiver.speaking.on('end', (id) => speaking.delete(id));
+    vcConn = conn;
+    return 'full';
+  } catch (e) {
+    console.error('Full voice connection failed, using channel-only mode:', e.message);
+    try { conn?.destroy(); } catch {}
+    sendVoiceState(guild, ch.id);
+    return 'basic';
+  }
+}
 
 app.post('/vc/join', needKey, async (req, res) => {
   try {
@@ -86,17 +106,20 @@ app.post('/vc/join', needKey, async (req, res) => {
     const guild = await client.guilds.fetch(GUILD_ID);
     const ch = guild.voiceStates.cache.get(uid)?.channel;
     if (!ch) return res.status(400).json({ error: 'Join a voice channel in Discord first.' });
-    sendVoiceState(guild, ch.id);
+    if (vcConn) { try { vcConn.destroy(); } catch {} vcConn = null; }
+    speaking.clear();
+    const mode = await connectVoice(guild, ch);
     vcOwner = uid; vcChannel = ch.id;
-    res.json({ channel: ch.name });
+    res.json({ channel: ch.name, mode });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Could not join the voice channel.' }); }
 });
 
 app.post('/vc/leave', needKey, async (req, res) => {
   try {
     if (vcChannel && String(req.body.userId) === vcOwner) {
-      sendVoiceState(await client.guilds.fetch(GUILD_ID), null);
-      vcOwner = null; vcChannel = null;
+      if (vcConn) { try { vcConn.destroy(); } catch {} vcConn = null; }
+      else sendVoiceState(await client.guilds.fetch(GUILD_ID), null);
+      speaking.clear(); vcOwner = null; vcChannel = null;
     }
   } catch (e) { console.error(e); }
   res.json({ ok: true });
@@ -107,8 +130,8 @@ app.get('/vc/members', needKey, async (req, res) => {
   const guild = await client.guilds.fetch(GUILD_ID);
   const ch = guild.channels.cache.get(vcChannel);
   if (!ch) return res.status(404).json({ error: 'Not connected.' });
-  res.json({ members: [...ch.members.values()].filter(m => !m.user.bot)
-    .map(m => ({ id: m.id, name: m.displayName, avatar: m.displayAvatarURL({ extension: 'png', size: 128 }) })) });
+  res.json({ channel: ch.name, members: [...ch.members.values()].filter(m => !m.user.bot)
+    .map(m => ({ id: m.id, name: m.displayName, avatar: m.displayAvatarURL({ extension: 'png', size: 128 }), speaking: speaking.has(m.id) })) });
 });
 
 // ---------- YouTube: the bot holds ONE Google login so casters never sign in to Google ----------
