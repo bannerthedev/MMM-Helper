@@ -183,8 +183,10 @@ app.post('/yt/start', needKey, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
-// ---------- app updates: the app asks the bot, the bot reads your latest GitHub release ----------
-// Set GITHUB_REPO (owner/name) and, if the repo is private, GITHUB_TOKEN. The exe is never public.
+// ---------- app updates: the apps ask the bot, the bot reads your latest GitHub release ----------
+// Attach BOTH files to each release: MMMOfficialApp.exe and MMMMatchTimer.exe. Set GITHUB_REPO (owner/name),
+// plus GITHUB_TOKEN if the repo is private (the .exe files are then never public).
+const ghHeaders = (accept) => ({ Accept: accept, 'User-Agent': 'mmm-bot', ...(process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}) });
 let relCache = { at: 0, data: null };
 async function latestRelease() {
   if (relCache.data && Date.now() - relCache.at < 60000) return relCache.data;
@@ -192,19 +194,19 @@ async function latestRelease() {
   const r = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPO}/releases/latest`, { headers: ghHeaders('application/vnd.github+json') });
   if (!r.ok) throw new Error(`Could not read the latest release (${r.status}).`);
   const j = await r.json();
-  const asset = (j.assets || []).find(a => /\.exe$/i.test(a.name));
-  if (!asset) throw new Error('The latest release has no .exe file attached.');
-  relCache = { at: Date.now(), data: { version: String(j.tag_name).replace(/^v/i, ''), notes: j.body || '', asset } };
+  relCache = { at: Date.now(), data: { version: String(j.tag_name).replace(/^v/i, ''), notes: j.body || '', assets: j.assets || [] } };
   return relCache.data;
 }
-const ghHeaders = (accept) => ({ Accept: accept, 'User-Agent': 'mmm-bot', ...(process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}) });
 app.get('/update/latest', needKey, async (req, res) => {
   try { const r = await latestRelease(); res.json({ version: r.version, notes: r.notes }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/update/download', needKey, async (req, res) => {
   try {
-    const { asset } = await latestRelease();
+    const { assets } = await latestRelease();
+    const want = req.query.file === 'timer' ? /matchtimer/i : /officialapp/i;
+    const asset = assets.find(a => /\.exe$/i.test(a.name) && want.test(a.name));
+    if (!asset) return res.status(404).json({ error: `The latest release has no ${req.query.file === 'timer' ? 'MMMMatchTimer.exe' : 'MMMOfficialApp.exe'} attached.` });
     const r = await fetch(asset.url, { headers: ghHeaders('application/octet-stream'), redirect: 'follow' });
     if (!r.ok) return res.status(500).json({ error: `Could not download the update (${r.status}).` });
     res.setHeader('Content-Type', 'application/octet-stream');
@@ -239,7 +241,7 @@ app.post('/match/info', needKey, async (req, res) => {
       if (o.team1 || o.team2 || o.comm.length || o.ref || o.caster) { Object.assign(out, o); used = m; break; }
     }
     const sample = used ? null : String(msgs.first()?.cleanContent || '(no text - is Message Content Intent on?)').slice(0, 140);
-    res.json({ commentators: [out.comm[0] || null, out.comm[1] || null], team1: out.team1, team2: out.team2, ref: out.ref, caster: out.caster,
+    res.json({ commentators: [out.comm[0] || null, out.comm[1] || null], team1: canonTeam(out.team1), team2: canonTeam(out.team2), ref: out.ref, caster: out.caster,
       channel: ch.name, found: !!used, sample, lineups: Object.fromEntries([...lineups].map(([k, v]) => [k, v.players])) });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Could not read the match channel.' }); }
 });
@@ -263,10 +265,89 @@ client.on('interactionCreate', async (i) => {
   i.reply(`Saved the line-up for **${team}**: ${players.join(', ')}`);
 });
 
+// ---------- teams: names, colors (Google Sheet) and Discord role tracking ----------
+// [full name, short name]. The bot understands BOTH everywhere (sheet rows, role names, the assignments channel).
+const TEAMS = [
+  ['ACID', 'ACID'], ['Get Hawked', 'GH'], ['Party Hat Pirates', 'PHP'], ['Cursed Kats', 'CK'], ['FEAR', 'FEAR'], ['Ruthless', 'RL'],
+  ['Dare Devil', 'DD'], ['HOP', 'HOP'], ['Killer Dolphin', 'KD'], ['Yacer Yacer Yacer', 'YYY'], ['Faithfull Monkeys', 'FM'],
+  ['Electronic Tree Troopers', 'ETT'], ['Angry Monkes', 'AM'], ['The European Monkeys', 'TEM'], ['Energy', 'NRG'], ['Zodiac', 'ZODI'],
+  ['Zero Tolerance', 'ZT'], ['Gelato', 'GATO'], ['Suppression', 'SUP'], ['Overly Competitive Monkeys', 'OCM'], ['Speedy Monkeys Jay', 'SMJ'],
+  ['Sleepy', 'SLPY'], ['Competitive Intelligence Agency', 'CIA'], ['EVNY', 'EVNY'], ['Sexy Gorillas', 'SG'], ['Pure', 'Pure'],
+  ['Varsity', 'VAR'], ['Fate', 'Fate']
+];
+const normKey = (t) => String(t || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+const canonTeam = (name) => { if (!name) return name; const k = normKey(name); const t = TEAMS.find(([f, sh]) => normKey(f) === k || normKey(sh) === k); return t ? t[0] : name; };
+
+function parseCsv(text) {
+  const rows = []; let row = [], cur = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+    else if (c === '"') q = true;
+    else if (c === ',') { row.push(cur); cur = ''; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cur); cur = ''; rows.push(row); row = []; }
+    else cur += c;
+  }
+  if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+  return rows;
+}
+// Column A = team name (full OR short), Column B = hex color. The sheet must be shared as "Anyone with the link can view".
+async function loadSheetColors() {
+  const id = process.env.TEAMS_SHEET_ID || '1aSA3Etwlnjt_33G7Dn_356YcCmRuC8za9uI8PGvLgBw', gid = process.env.TEAMS_SHEET_GID || '0';
+  const r = await fetch(`https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`);
+  const text = await r.text();
+  if (!r.ok || /^\s*</.test(text)) throw new Error('the sheet is not shared publicly (set it to "Anyone with the link can view")');
+  const colors = new Map();
+  for (const [a, b] of parseCsv(text)) {
+    const hex = String(b || '').trim();
+    if (a && /^#?[0-9a-f]{6}$/i.test(hex)) colors.set(normKey(a), hex.startsWith('#') ? hex.toLowerCase() : '#' + hex.toLowerCase());
+  }
+  return colors;
+}
+
+let teamCache = { at: 0, data: null }; const lastStatus = new Map();
+async function notifyTeam(t) {
+  const text = `⚠️ Team **${t.name}** was ${t.status === 'deleted' ? 'deleted' : 'disbanded'} (its Discord role ${t.status === 'deleted' ? 'is gone' : 'has no members'}). It was removed from the Match Timer team list.`;
+  console.log(text);
+  if (process.env.TEAM_LOG_CHANNEL_ID) { const ch = await client.channels.fetch(process.env.TEAM_LOG_CHANNEL_ID).catch(() => null); if (ch?.send) await ch.send(text).catch(console.error); }
+}
+async function getTeams(force = false) {
+  if (!force && teamCache.data && Date.now() - teamCache.at < 60000) return teamCache.data;
+  let colors = new Map(), sheetError = null;
+  try { colors = await loadSheetColors(); } catch (e) { sheetError = e.message; console.error('Teams sheet:', e.message); }
+  const guild = await client.guilds.fetch(GUILD_ID);
+  await guild.roles.fetch(); await guild.members.fetch();
+  const list = TEAMS.map(([name, short]) => {
+    const keys = [normKey(name), normKey(short)];
+    const role = guild.roles.cache.find(r => keys.includes(normKey(r.name)));
+    const status = !role ? 'deleted' : role.members.size === 0 ? 'disbanded' : 'active';
+    return { name, short, color: colors.get(normKey(name)) || colors.get(normKey(short)) || null, status };
+  });
+  // If NO team role matches at all, the role names don't follow the team names, so don't hide anything.
+  const tracked = list.some(t => t.status !== 'deleted');
+  for (const t of list) {
+    const prev = lastStatus.get(t.name);
+    if (tracked && prev === 'active' && t.status !== 'active') notifyTeam(t).catch(console.error);
+    lastStatus.set(t.name, t.status);
+  }
+  teamCache = { at: Date.now(), data: { teams: list, tracked, sheetError } };
+  return teamCache.data;
+}
+app.get('/teams', needKey, async (req, res) => {
+  try {
+    const d = await getTeams(req.query.refresh === '1');
+    const visible = d.tracked ? d.teams.filter(t => t.status === 'active') : d.teams;
+    res.json({ teams: visible.map(({ name, short, color }) => ({ name, short, color })), tracked: d.tracked, sheetError: d.sheetError,
+      removed: d.tracked ? d.teams.filter(t => t.status !== 'active').map(t => ({ name: t.name, status: t.status })) : [] });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Could not load the teams.' }); }
+});
+client.on('roleDelete', () => { teamCache.at = 0; getTeams(true).catch(() => {}); }); // a team role was deleted: re-check right away
+
 client.once('ready', async () => {
   console.log(`Bot online as ${client.user.tag}`);
   try { await (await client.guilds.fetch(GUILD_ID)).commands.set([lineUpCommand.toJSON()]); console.log('Slash command /line-up registered'); }
   catch (e) { console.error('Could not register /line-up:', e.message); }
+  getTeams(true).catch((e) => console.error('Teams:', e.message)); setInterval(() => getTeams(true).catch(() => {}), 10 * 60 * 1000);
   app.listen(PORT, () => console.log(`API on :${PORT}`));
 });
 client.login(DISCORD_TOKEN);
