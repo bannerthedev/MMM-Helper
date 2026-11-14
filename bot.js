@@ -30,6 +30,7 @@ const needKey = (req, res, next) => {
 
 const app = express();
 app.use(express.json());
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 // ---------- sign-in: the app sends the Discord OAuth code, the bot DMs a sign-in code ----------
 app.post('/auth/discord', async (req, res) => {
@@ -86,7 +87,7 @@ async function connectVoice(guild, ch) {
   let conn = null;
   try {
     conn = joinVoiceChannel({ channelId: ch.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: false, selfMute: true });
-    await entersState(conn, VoiceConnectionStatus.Ready, 12000);
+    await entersState(conn, VoiceConnectionStatus.Ready, 8000);
     conn.receiver.speaking.on('start', (id) => speaking.add(id));
     conn.receiver.speaking.on('end', (id) => speaking.delete(id));
     vcConn = conn;
@@ -174,11 +175,11 @@ app.post('/yt/start', needKey, async (req, res) => {
     const tr = await fetch(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${b.id}&uploadType=media`, { method: 'POST',
       headers: { Authorization: `Bearer ${await ytToken()}`, 'Content-Type': 'image/png' }, body: fs.readFileSync(path.join(__dirname, 'thumbnail.png')) });
 
-    // If the bot is connected to a voice channel, post the live link in that voice channel's text chat
-    if (vcChannel) {
-      const ch = guild.channels.cache.get(vcChannel);
-      if (ch?.send) await ch.send(`🔴 **LIVE:** ${title}\nhttps://www.youtube.com/watch?v=${b.id}`).catch(console.error);
-    }
+    // post the live link in the channel you set (LIVE_CHANNEL_ID); if none is set, in the voice channel's chat
+    const liveMsg = `🔴 **LIVE:** ${title}\nhttps://www.youtube.com/watch?v=${b.id}`;
+    const target = process.env.LIVE_CHANNEL_ID ? await client.channels.fetch(process.env.LIVE_CHANNEL_ID).catch(() => null)
+      : (vcChannel ? guild.channels.cache.get(vcChannel) : null);
+    if (target?.send) await target.send(liveMsg).catch(console.error);
     res.json({ title, streamKey: stream.cdn.ingestionInfo.streamName, thumbOk: tr.ok });
   } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
@@ -294,7 +295,7 @@ function parseCsv(text) {
 // Column A = team name (full OR short), Column B = hex color. The sheet must be shared as "Anyone with the link can view".
 async function loadSheetColors() {
   const id = process.env.TEAMS_SHEET_ID || '1aSA3Etwlnjt_33G7Dn_356YcCmRuC8za9uI8PGvLgBw', gid = process.env.TEAMS_SHEET_GID || '0';
-  const r = await fetch(`https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`);
+  const r = await fetch(`https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`, { signal: AbortSignal.timeout(8000) });
   const text = await r.text();
   if (!r.ok || /^\s*</.test(text)) throw new Error('the sheet is not shared publicly (set it to "Anyone with the link can view")');
   const colors = new Map();
@@ -305,7 +306,7 @@ async function loadSheetColors() {
   return colors;
 }
 
-let teamCache = { at: 0, data: null }; const lastStatus = new Map();
+let teamCache = { at: 0, data: null }; const lastStatus = new Map(); let membersLoaded = false;
 async function notifyTeam(t) {
   const text = `⚠️ Team **${t.name}** was ${t.status === 'deleted' ? 'deleted' : 'disbanded'} (its Discord role ${t.status === 'deleted' ? 'is gone' : 'has no members'}). It was removed from the Match Timer team list.`;
   console.log(text);
@@ -316,7 +317,8 @@ async function getTeams(force = false) {
   let colors = new Map(), sheetError = null;
   try { colors = await loadSheetColors(); } catch (e) { sheetError = e.message; console.error('Teams sheet:', e.message); }
   const guild = await client.guilds.fetch(GUILD_ID);
-  await guild.roles.fetch(); await guild.members.fetch();
+  await guild.roles.fetch();
+  if (!membersLoaded) { await guild.members.fetch(); membersLoaded = true; } // once; the gateway keeps the cache up to date
   const list = TEAMS.map(([name, short]) => {
     const keys = [normKey(name), normKey(short)];
     const role = guild.roles.cache.find(r => keys.includes(normKey(r.name)));
@@ -335,7 +337,11 @@ async function getTeams(force = false) {
 }
 app.get('/teams', needKey, async (req, res) => {
   try {
-    const d = await getTeams(req.query.refresh === '1');
+    // answer instantly from the cache and refresh in the background, so the app never waits on Discord or the sheet
+    if (req.query.refresh === '1') await getTeams(true);
+    else if (teamCache.data && Date.now() - teamCache.at > 60000) getTeams(true).catch(() => {});
+    const d = teamCache.data || await Promise.race([getTeams(), new Promise(r => setTimeout(() => r(null), 8000))]);
+    if (!d) return res.json({ teams: TEAMS.map(([name, short]) => ({ name, short, color: null })), tracked: false, sheetError: 'still loading, try Reload in a moment', removed: [] });
     const visible = d.tracked ? d.teams.filter(t => t.status === 'active') : d.teams;
     res.json({ teams: visible.map(({ name, short, color }) => ({ name, short, color })), tracked: d.tracked, sheetError: d.sheetError,
       removed: d.tracked ? d.teams.filter(t => t.status !== 'active').map(t => ({ name: t.name, status: t.status })) : [] });
