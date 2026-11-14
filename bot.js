@@ -171,7 +171,17 @@ function explainYt(e) {
     return 'The Google login does not have YouTube permission. Run get-google-token.js again and allow YouTube.';
   return m || 'YouTube request failed';
 }
-const FIXED_DESCRIPTION = 'If you want to join the discord:\nhttps://discord.gg/mmml';
+const FIXED_DESCRIPTION = `WHAT AN AMAZING SCRIM FROM BOTH OF OUR INCREDIBLE TEAMS! 🔥
+
+A HUGE thank you to our commentators, caster, and referee for making this match absolutely incredible to watch and play!
+
+If you want to see more intense and competitive matches, make sure to SUBSCRIBE! You can also join our Discord for much more information, including how to apply a team to compete in MMM or even find a team to join!
+
+🔗 Discord:  https://discord.gg/mmml
+
+JOIN TODAY!
+
+BE THE BEST AND ONLY THE BEST.`;
 const tidy = (v, d) => String(v || d).replace(/[<>\n\r]/g, '').trim().slice(0, 30) || d;
 
 app.post('/yt/start', needKey, async (req, res) => {
