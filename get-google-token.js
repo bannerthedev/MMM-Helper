@@ -13,5 +13,11 @@ const srv = http.createServer(async (req, res) => {
     client_id: id, client_secret: secret, redirect_uri: redirect, grant_type: 'authorization_code' }) });
   const j = await r.json(); res.end(j.refresh_token ? 'Done. Go back to the terminal.' : 'Failed. See the terminal.');
   console.log(j.refresh_token ? '\nGOOGLE_REFRESH_TOKEN=' + j.refresh_token + '\n' : '\nNo refresh token returned: ' + JSON.stringify(j));
+  if (j.refresh_token) { // check it really works, with THIS client id, before you copy it
+    const v = await (await fetch('https://oauth2.googleapis.com/token', { method: 'POST', body: new URLSearchParams({
+      client_id: id, client_secret: secret, refresh_token: j.refresh_token, grant_type: 'refresh_token' }) })).json();
+    console.log(v.access_token ? 'VERIFIED: this token works.' : 'NOT working: ' + JSON.stringify(v));
+    console.log('Railway must use THIS client id (ends ...' + id.slice(-22) + ') and the matching client secret.\n');
+  }
   srv.close(); // let Node exit on its own (calling process.exit here crashes on Windows)
 }).listen(53684, '127.0.0.1');
