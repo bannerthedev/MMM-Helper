@@ -143,7 +143,7 @@ async function ytToken() {
     client_id: process.env.GOOGLE_CLIENT_ID, client_secret: process.env.GOOGLE_CLIENT_SECRET,
     refresh_token: process.env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }) });
   const j = await r.json();
-  if (!r.ok) throw new Error('Google login failed: ' + (j.error_description || j.error));
+  if (!r.ok) { const e = new Error('Google login failed: ' + (j.error_description || j.error)); e.code = j.error; throw e; }
   ytCache = { token: j.access_token, exp: Date.now() + j.expires_in * 1000 };
   return ytCache.token;
 }
@@ -151,8 +151,25 @@ async function yt(method, endpoint, query, body) {
   const r = await fetch(`https://www.googleapis.com/youtube/v3/${endpoint}?${new URLSearchParams(query)}`, { method,
     headers: { Authorization: `Bearer ${await ytToken()}`, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
   const j = await r.json();
-  if (!r.ok) throw new Error(j.error?.message || 'YouTube request failed');
+  if (!r.ok) { const e = new Error(j.error?.message || 'YouTube request failed'); e.reason = j.error?.errors?.[0]?.reason; throw e; }
   return j;
+}
+// turn YouTube / Google errors into plain instructions
+function explainYt(e) {
+  const m = String(e.message || '');
+  if (e.code === 'invalid_grant' || /invalid_grant|expired or revoked/i.test(m))
+    return 'Google login expired. Run get-google-token.js again, paste the new token into Railway as GOOGLE_REFRESH_TOKEN, and set your Google app to "In production" so it stops expiring.';
+  if (e.code === 'invalid_client' || /invalid_client/i.test(m))
+    return 'GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET in Railway is wrong. Use the pair that made the refresh token.';
+  if (/Google login failed/i.test(m) && !process.env.GOOGLE_REFRESH_TOKEN) return 'GOOGLE_REFRESH_TOKEN is not set in Railway.';
+  if (e.reason === 'liveStreamingNotEnabled' || /not enabled for live streaming/i.test(m))
+    return 'This YouTube channel is not enabled for live streaming. Turn it on at youtube.com/features (it can take up to 24 hours).';
+  if (e.reason === 'accessNotConfigured' || /has not been used in project|is disabled/i.test(m))
+    return 'The YouTube Data API v3 is not enabled in your Google Cloud project. Enable it, wait a few minutes, then try again.';
+  if (e.reason === 'quotaExceeded' || /quota/i.test(m)) return "YouTube's daily limit is used up. It resets at midnight Pacific time.";
+  if (e.reason === 'insufficientPermissions' || /insufficient/i.test(m))
+    return 'The Google login does not have YouTube permission. Run get-google-token.js again and allow YouTube.';
+  return m || 'YouTube request failed';
 }
 const FIXED_DESCRIPTION = 'If you want to join the discord:\nhttps://discord.gg/mmml';
 const tidy = (v, d) => String(v || d).replace(/[<>\n\r]/g, '').trim().slice(0, 30) || d;
@@ -181,7 +198,7 @@ app.post('/yt/start', needKey, async (req, res) => {
       : (vcChannel ? guild.channels.cache.get(vcChannel) : null);
     if (target?.send) await target.send(liveMsg).catch(console.error);
     res.json({ title, streamKey: stream.cdn.ingestionInfo.streamName, thumbOk: tr.ok });
-  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('YouTube start failed:', e.message, e.reason || e.code || ''); res.status(500).json({ error: explainYt(e) }); }
 });
 
 // ---------- app updates: the apps ask the bot, the bot reads your latest GitHub release ----------
