@@ -136,13 +136,16 @@ app.get('/vc/members', needKey, async (req, res) => {
 });
 
 // ---------- YouTube: the bot holds ONE Google login so casters never sign in to Google ----------
+// pasted values often carry spaces, quotes, a newline, or a leading NAME= : clean them
+const envClean = (name) => String(process.env[name] || '').trim().replace(/^["']+|["']+$/g, '').replace(new RegExp('^' + name + '\\s*='), '').trim();
 let ytCache = { token: null, exp: 0 };
 async function ytToken() {
   if (ytCache.token && Date.now() < ytCache.exp - 60000) return ytCache.token;
   const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', body: new URLSearchParams({
-    client_id: process.env.GOOGLE_CLIENT_ID, client_secret: process.env.GOOGLE_CLIENT_SECRET,
-    refresh_token: process.env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }) });
+    client_id: envClean('GOOGLE_CLIENT_ID'), client_secret: envClean('GOOGLE_CLIENT_SECRET'),
+    refresh_token: envClean('GOOGLE_REFRESH_TOKEN'), grant_type: 'refresh_token' }) });
   const j = await r.json();
+  if (!r.ok) console.error(`Google token refresh failed (${j.error}): client id ends ...${envClean('GOOGLE_CLIENT_ID').slice(-22)}, token length ${envClean('GOOGLE_REFRESH_TOKEN').length}`);
   if (!r.ok) { const e = new Error('Google login failed: ' + (j.error_description || j.error)); e.code = j.error; throw e; }
   ytCache = { token: j.access_token, exp: Date.now() + j.expires_in * 1000 };
   return ytCache.token;
@@ -158,7 +161,7 @@ async function yt(method, endpoint, query, body) {
 function explainYt(e) {
   const m = String(e.message || '');
   if (e.code === 'invalid_grant' || /invalid_grant|expired or revoked/i.test(m))
-    return 'Google login expired. Run get-google-token.js again, paste the new token into Railway as GOOGLE_REFRESH_TOKEN, and set your Google app to "In production" so it stops expiring.';
+    return 'Google rejected the stored login. Check: (1) Railway GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET are the SAME pair used to make the token, (2) you clicked Deploy after changing the variables, (3) the token was pasted with no spaces or quotes, (4) the Google app is "In production". See the bot logs for details.';
   if (e.code === 'invalid_client' || /invalid_client/i.test(m))
     return 'GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET in Railway is wrong. Use the pair that made the refresh token.';
   if (/Google login failed/i.test(m) && !process.env.GOOGLE_REFRESH_TOKEN) return 'GOOGLE_REFRESH_TOKEN is not set in Railway.';
@@ -378,6 +381,7 @@ client.on('roleDelete', () => { teamCache.at = 0; getTeams(true).catch(() => {})
 
 client.once('ready', async () => {
   console.log(`Bot online as ${client.user.tag}`);
+  console.log(`Google config: client id ...${envClean('GOOGLE_CLIENT_ID').slice(-22)} | secret length ${envClean('GOOGLE_CLIENT_SECRET').length} | refresh token length ${envClean('GOOGLE_REFRESH_TOKEN').length} (starts "${envClean('GOOGLE_REFRESH_TOKEN').slice(0, 4)}")`);
   try { await (await client.guilds.fetch(GUILD_ID)).commands.set([lineUpCommand.toJSON()]); console.log('Slash command /line-up registered'); }
   catch (e) { console.error('Could not register /line-up:', e.message); }
   getTeams(true).catch((e) => console.error('Teams:', e.message)); setInterval(() => getTeams(true).catch(() => {}), 10 * 60 * 1000);
