@@ -17,7 +17,8 @@ const srv = http.createServer(async (req, res) => {
     const v = await (await fetch('https://oauth2.googleapis.com/token', { method: 'POST', body: new URLSearchParams({
       client_id: id, client_secret: secret, refresh_token: j.refresh_token, grant_type: 'refresh_token' }) })).json();
     console.log(v.access_token ? 'VERIFIED: this token works.' : 'NOT working: ' + JSON.stringify(v));
-    console.log('Railway must use THIS client id (ends ...' + id.slice(-22) + ') and the matching client secret.\n');
+    console.log('Token length: ' + j.refresh_token.length + ' (starts "' + j.refresh_token.slice(0, 4) + '")');
+    console.log('Railway must use THIS client id (starts ' + id.slice(0, 12) + '...) and the matching client secret.\n');
   }
   srv.close(); // let Node exit on its own (calling process.exit here crashes on Windows)
 }).listen(53684, '127.0.0.1');
