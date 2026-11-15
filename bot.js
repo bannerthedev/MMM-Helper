@@ -193,7 +193,8 @@ app.post('/yt/start', needKey, async (req, res) => {
     const guild = await client.guilds.fetch(GUILD_ID);
     const member = await guild.members.fetch(String(req.body.userId)).catch(() => null);
     if (!member || !hasRole(member, CASTER)) return res.status(403).json({ error: 'Only casters can start a stream.' });
-    const title = `${tidy(req.body.team1, 'Team 1')} vs ${tidy(req.body.team2, 'Team 2')} | Monke Monke Monke | ${tidy(req.body.round, 'Bracket Round 1')}`;
+    const t1 = tidy(req.body.team1, 'Team 1'), t2 = tidy(req.body.team2, 'Team 2');
+    const title = `${t1} vs ${t2} | Monke Monke Monke | ${tidy(req.body.round, 'Bracket Round 1')}`;
 
     let stream = (await yt('GET', 'liveStreams', { part: 'snippet,cdn', mine: 'true', maxResults: '10' })).items?.[0];
     if (!stream) stream = await yt('POST', 'liveStreams', { part: 'snippet,cdn' }, { snippet: { title: 'MMM Stream' },
@@ -207,10 +208,15 @@ app.post('/yt/start', needKey, async (req, res) => {
       headers: { Authorization: `Bearer ${await ytToken()}`, 'Content-Type': 'image/png' }, body: fs.readFileSync(path.join(__dirname, 'thumbnail.png')) });
 
     // post the live link in the channel you set (LIVE_CHANNEL_ID); if none is set, in the voice channel's chat
-    const liveMsg = `🔴 **LIVE:** ${title}\nhttps://www.youtube.com/watch?v=${b.id}`;
+    // Discord post:   @MatchPing   then a big heading "TEAM vs TEAM" that links to the live
+    await guild.roles.fetch().catch(() => {});
+    const pingRole = process.env.MATCH_PING_ROLE_ID ? guild.roles.cache.get(process.env.MATCH_PING_ROLE_ID)
+      : guild.roles.cache.find(r => r.name.trim().toLowerCase() === 'matchping');
+    const linkText = `${t1} vs ${t2}`.replace(/[\[\]()]/g, '');
+    const liveMsg = `${pingRole ? `<@&${pingRole.id}>` : '@MatchPing'}\n# [${linkText}](https://www.youtube.com/watch?v=${b.id})`;
     const target = process.env.LIVE_CHANNEL_ID ? await client.channels.fetch(process.env.LIVE_CHANNEL_ID).catch(() => null)
       : (vcChannel ? guild.channels.cache.get(vcChannel) : null);
-    if (target?.send) await target.send(liveMsg).catch(console.error);
+    if (target?.send) await target.send({ content: liveMsg, allowedMentions: { roles: pingRole ? [pingRole.id] : [] } }).catch(console.error);
     res.json({ title, streamKey: stream.cdn.ingestionInfo.streamName, thumbOk: tr.ok });
   } catch (e) { console.error('YouTube start failed:', e.message, e.reason || e.code || ''); res.status(500).json({ error: explainYt(e) }); }
 });
