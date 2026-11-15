@@ -138,14 +138,15 @@ app.get('/vc/members', needKey, async (req, res) => {
 // ---------- YouTube: the bot holds ONE Google login so casters never sign in to Google ----------
 // pasted values often carry spaces, quotes, a newline, or a leading NAME= : clean them
 const envClean = (name) => String(process.env[name] || '').trim().replace(/^["']+|["']+$/g, '').replace(new RegExp('^' + name + '\\s*='), '').trim();
+const refreshTokenClean = () => { const raw = envClean('GOOGLE_REFRESH_TOKEN'); const m = raw.match(/1\/\/[A-Za-z0-9_\-.~]+/); return m ? m[0] : raw; };
 let ytCache = { token: null, exp: 0 };
 async function ytToken() {
   if (ytCache.token && Date.now() < ytCache.exp - 60000) return ytCache.token;
   const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', body: new URLSearchParams({
     client_id: envClean('GOOGLE_CLIENT_ID'), client_secret: envClean('GOOGLE_CLIENT_SECRET'),
-    refresh_token: envClean('GOOGLE_REFRESH_TOKEN'), grant_type: 'refresh_token' }) });
+    refresh_token: refreshTokenClean(), grant_type: 'refresh_token' }) });
   const j = await r.json();
-  if (!r.ok) console.error(`Google token refresh failed (${j.error}): client id ends ...${envClean('GOOGLE_CLIENT_ID').slice(-22)}, token length ${envClean('GOOGLE_REFRESH_TOKEN').length}`);
+  if (!r.ok) console.error(`Google token refresh failed (${j.error}): client id starts ${envClean('GOOGLE_CLIENT_ID').slice(0, 12)}..., token length ${refreshTokenClean().length}`);
   if (!r.ok) { const e = new Error('Google login failed: ' + (j.error_description || j.error)); e.code = j.error; throw e; }
   ytCache = { token: j.access_token, exp: Date.now() + j.expires_in * 1000 };
   return ytCache.token;
@@ -381,7 +382,7 @@ client.on('roleDelete', () => { teamCache.at = 0; getTeams(true).catch(() => {})
 
 client.once('ready', async () => {
   console.log(`Bot online as ${client.user.tag}`);
-  console.log(`Google config: client id ...${envClean('GOOGLE_CLIENT_ID').slice(-22)} | secret length ${envClean('GOOGLE_CLIENT_SECRET').length} | refresh token length ${envClean('GOOGLE_REFRESH_TOKEN').length} (starts "${envClean('GOOGLE_REFRESH_TOKEN').slice(0, 4)}")`);
+  console.log(`Google config: client id starts ${envClean('GOOGLE_CLIENT_ID').slice(0, 12)}... | secret length ${envClean('GOOGLE_CLIENT_SECRET').length} | refresh token length ${refreshTokenClean().length} (starts "${refreshTokenClean().slice(0, 4)}")`);
   try { await (await client.guilds.fetch(GUILD_ID)).commands.set([lineUpCommand.toJSON()]); console.log('Slash command /line-up registered'); }
   catch (e) { console.error('Could not register /line-up:', e.message); }
   getTeams(true).catch((e) => console.error('Teams:', e.message)); setInterval(() => getTeams(true).catch(() => {}), 10 * 60 * 1000);
