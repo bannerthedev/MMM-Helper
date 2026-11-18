@@ -30,6 +30,18 @@ const needKey = (req, res, next) => {
 
 const app = express();
 app.use(express.json());
+// Website-to-bot API access. Set WEBSITE_ORIGIN to your public website origin(s), comma-separated.
+// If unset, the API allows any origin; use an explicit origin list in production.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const allowed = String(process.env.WEBSITE_ORIGIN || '').split(',').map(x => x.trim()).filter(Boolean);
+  if (!allowed.length) res.setHeader('Access-Control-Allow-Origin', '*');
+  else if (origin && allowed.includes(origin)) { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin'); }
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // ---------- sign-in: the app sends the Discord OAuth code, the bot DMs a sign-in code ----------
@@ -48,8 +60,18 @@ app.post('/auth/discord', async (req, res) => {
     if (!member) return res.status(403).json({ error: 'You need to be in the MMM Discord server to sign in.' });
 
     console.log(`Sign-in: ${member.displayName} has roles [${rolesOf(member).join(', ')}]`);
-    const user = { userId: me.id, username: member.displayName || me.username, role: roleOf(member), roles: rolesOf(member),
-      avatar: member.displayAvatarURL({ extension: 'png', size: 128 }) };
+    const avatarExt = me.avatar && me.avatar.startsWith('a_') ? 'gif' : 'png';
+    const bannerExt = me.banner && me.banner.startsWith('a_') ? 'gif' : 'png';
+    const user = {
+      userId: me.id,
+      username: me.username,
+      displayName: member.displayName || me.global_name || me.username,
+      globalName: me.global_name || null,
+      role: roleOf(member),
+      roles: rolesOf(member),
+      avatar: me.avatar ? `https://cdn.discordapp.com/avatars/${me.id}/${me.avatar}.${avatarExt}?size=256` : null,
+      banner: me.banner ? `https://cdn.discordapp.com/banners/${me.id}/${me.banner}.${bannerExt}?size=1024` : null
+    };
     const c = newCode();
     codes.set(me.id, { code: c, expires: Date.now() + 5 * 60 * 1000, user });
     tries.delete(me.id);
@@ -71,7 +93,138 @@ app.post('/auth/verify', (req, res) => {
   if (!entry || Date.now() > entry.expires) return res.status(400).json({ error: 'That code expired. Sign in again.' });
   if (String(code).toUpperCase() !== entry.code) return res.status(400).json({ error: 'Wrong code.' });
   codes.delete(userId); // single use
-  res.json({ user: entry.user });
+  tries.delete(userId);
+  // Refresh the Discord identity fields on an existing, staff-created player record.
+  if (playerStats[userId]) {
+    playerStats[userId] = cleanPlayerRecord({
+      ...playerStats[userId], name: entry.user.displayName, username: entry.user.username,
+      avatarUrl: entry.user.avatar, bannerUrl: entry.user.banner
+    }, playerStats[userId]);
+    savePlayerStats();
+  }
+  const token = createPlayerSession(entry.user);
+  res.json({ user: entry.user, token });
+});
+
+
+// ---------- MMM player profiles / verified statistics ----------
+// PLAYER_SESSION_SECRET should be a long random secret in production.
+// If it is omitted, the bot falls back to an existing server secret; last-resort
+// random fallback means sessions are invalidated whenever the process restarts.
+const PLAYER_SESSION_SECRET = process.env.PLAYER_SESSION_SECRET || BOT_API_KEY || DISCORD_CLIENT_SECRET || crypto.randomBytes(32).toString('hex');
+const PLAYER_STATS_FILE = path.join(__dirname, 'player-stats.json');
+let playerStats = {};
+let playerStatsUpdatedAt = null;
+try {
+  const saved = JSON.parse(fs.readFileSync(PLAYER_STATS_FILE, 'utf8'));
+  playerStats = saved && typeof saved.players === 'object' && saved.players ? saved.players : {};
+  playerStatsUpdatedAt = saved.updatedAt || null;
+} catch { playerStats = {}; }
+
+function savePlayerStats() {
+  playerStatsUpdatedAt = new Date().toISOString();
+  const temp = PLAYER_STATS_FILE + '.tmp';
+  fs.writeFileSync(temp, JSON.stringify({ updatedAt: playerStatsUpdatedAt, players: playerStats }, null, 2));
+  fs.renameSync(temp, PLAYER_STATS_FILE);
+}
+function createPlayerSession(user) {
+  const payload = Buffer.from(JSON.stringify({ user, exp: Date.now() + 7 * 24 * 60 * 60 * 1000 })).toString('base64url');
+  const signature = crypto.createHmac('sha256', PLAYER_SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+function readPlayerSession(req) {
+  const header = String(req.headers.authorization || '');
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature) return null;
+  const expected = crypto.createHmac('sha256', PLAYER_SESSION_SECRET).update(payload).digest();
+  let supplied;
+  try { supplied = Buffer.from(signature, 'base64url'); } catch { return null; }
+  if (expected.length !== supplied.length || !crypto.timingSafeEqual(expected, supplied)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (!data.user?.userId || !data.exp || Date.now() > data.exp) return null;
+    return data.user;
+  } catch { return null; }
+}
+function requirePlayerSession(req, res, next) {
+  const user = readPlayerSession(req);
+  if (!user) return res.status(401).json({ error: 'Your player session expired. Please sign in with Discord again.' });
+  req.playerUser = user;
+  next();
+}
+const safeText = (v, max = 80) => String(v ?? '').trim().slice(0, max);
+const safeNumber = (v, max = 100000000) => {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, max) : 0;
+};
+function cleanPlayerRecord(input, previous = {}) {
+  const p = input && typeof input === 'object' ? input : {};
+  const teamHistory = Array.isArray(p.teamHistory) ? p.teamHistory.slice(0, 40).map(t =>
+    safeText(typeof t === 'string' ? t : (t?.team || t?.name || ''), 60)).filter(Boolean) : previous.teamHistory || [];
+  return {
+    discordId: safeText(p.discordId || previous.discordId, 25),
+    name: safeText(p.name || p.displayName || previous.name, 60),
+    username: safeText(p.username || previous.username, 60),
+    avatarUrl: safeText(p.avatarUrl || previous.avatarUrl, 500),
+    bannerUrl: safeText(p.bannerUrl || previous.bannerUrl, 500),
+    currentTeam: safeText(p.currentTeam || previous.currentTeam, 60),
+    teamHistory,
+    season: safeText(p.season || previous.season, 30),
+    rank: safeNumber(p.rank ?? previous.rank, 10000),
+    wins: safeNumber(p.wins ?? previous.wins, 100000),
+    losses: safeNumber(p.losses ?? previous.losses, 100000),
+    winRate: safeNumber(p.winRate ?? previous.winRate, 100),
+    averageRunSeconds: safeNumber(p.averageRunSeconds ?? previous.averageRunSeconds, 86400),
+    totalTags: safeNumber(p.totalTags ?? previous.totalTags, 10000000),
+    longestRunSeconds: safeNumber(p.longestRunSeconds ?? previous.longestRunSeconds, 86400),
+    timeCaps: safeNumber(p.timeCaps ?? previous.timeCaps, 1000000),
+    seedingPosition: safeText(p.seedingPosition ?? previous.seedingPosition, 30),
+    bracketPosition: safeText(p.bracketPosition ?? previous.bracketPosition, 30),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+// Public directory: only published player fields are returned; Discord IDs are never exposed here.
+app.get('/public/player-stats', (req, res) => {
+  const players = Object.values(playerStats).map(({ discordId, ...p }) => p);
+  res.set('Cache-Control', 'public, max-age=30');
+  res.json({ players, updatedAt: playerStatsUpdatedAt });
+});
+
+// Signed-in player can retrieve only the record matching their verified Discord ID.
+app.get('/player/me', requirePlayerSession, (req, res) => {
+  const user = req.playerUser;
+  const player = playerStats[user.userId] || null;
+  res.set('Cache-Control', 'no-store');
+  res.json({ user, player });
+});
+
+// Admin-only management endpoints. Keep BOT_API_KEY on the server; never put it in website JavaScript.
+// PUT /admin/player-stats with { "player": { "discordId": "...", ...verified fields... } } creates/updates one record.
+app.get('/admin/player-stats', needKey, (req, res) => {
+  res.json({ players: Object.values(playerStats), updatedAt: playerStatsUpdatedAt });
+});
+app.put('/admin/player-stats', needKey, (req, res) => {
+  try {
+    const input = req.body?.player;
+    const discordId = safeText(input?.discordId, 25);
+    if (!/^\d{17,20}$/.test(discordId)) return res.status(400).json({ error: 'player.discordId must be a valid Discord user ID.' });
+    const record = cleanPlayerRecord({ ...input, discordId }, playerStats[discordId] || {});
+    playerStats[discordId] = record;
+    savePlayerStats();
+    res.json({ ok: true, player: record, updatedAt: playerStatsUpdatedAt });
+  } catch (e) {
+    console.error('Could not save player stats:', e);
+    res.status(500).json({ error: 'Could not save player statistics.' });
+  }
+});
+app.delete('/admin/player-stats/:discordId', needKey, (req, res) => {
+  const id = safeText(req.params.discordId, 25);
+  if (!playerStats[id]) return res.status(404).json({ error: 'Player record not found.' });
+  delete playerStats[id];
+  savePlayerStats();
+  res.json({ ok: true, updatedAt: playerStatsUpdatedAt });
 });
 
 // ---------- voice channel (commentators overlay) ----------
