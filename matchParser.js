@@ -19,4 +19,6 @@ function parseMatchText(text, out) {
   }
   return out;
 }
-module.exports = { parseMatchText };
+// Discord timestamps like <t:1762803000:t> -> unix seconds
+const extractTimes = (text) => [...String(text).matchAll(/<t:(\d{9,11})(?::[a-zA-Z])?>/g)].map(m => Number(m[1]));
+module.exports = { parseMatchText, extractTimes };
