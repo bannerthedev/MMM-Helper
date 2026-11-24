@@ -397,6 +397,41 @@ app.get('/teams', needKey, async (req, res) => {
 });
 client.on('roleDelete', () => { teamCache.at = 0; getTeams(true).catch(() => {}); }); // a team role was deleted: re-check right away
 
+// ---------- standings (another tab of your Google Sheet) ----------
+// Columns: A team (full or short name) | B wins | C losses | D total points | E logo image URL (optional; falls back to the team role's icon)
+// Seed = rank by wins, then total points. Set STANDINGS_SHEET_GID to that tab's gid. The sheet must be "Anyone with the link can view".
+let standCache = { at: 0, data: null };
+async function loadStandings() {
+  if (standCache.data && Date.now() - standCache.at < 60000) return standCache.data;
+  const gid = process.env.STANDINGS_SHEET_GID;
+  if (!gid) throw new Error('STANDINGS_SHEET_GID is not set on the bot (the sheet tab with Team, Wins, Losses, Points, Logo).');
+  const id = process.env.STANDINGS_SHEET_ID || process.env.TEAMS_SHEET_ID || '1aSA3Etwlnjt_33G7Dn_356YcCmRuC8za9uI8PGvLgBw';
+  const r = await fetch(`https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`, { signal: AbortSignal.timeout(8000) });
+  const text = await r.text();
+  if (!r.ok || /^\s*</.test(text)) throw new Error('the standings sheet is not shared publicly (set it to "Anyone with the link can view")');
+  const guild = await client.guilds.fetch(GUILD_ID); await guild.roles.fetch();
+  const rows = [];
+  for (const [a, w, l, p, logo] of parseCsv(text)) {
+    const wins = parseInt(w, 10), losses = parseInt(l, 10);
+    if (!a || Number.isNaN(wins) || Number.isNaN(losses)) continue; // skips the header row
+    const full = canonTeam(a.trim()), t = TEAMS.find(([f]) => f === full);
+    let img = String(logo || '').trim(); if (!/^https?:\/\//i.test(img)) img = null;
+    if (!img) {
+      const role = guild.roles.cache.find(x => normKey(x.name) === normKey(full) || (t && normKey(x.name) === normKey(t[1])));
+      img = role?.iconURL({ extension: 'png', size: 128 }) || null;
+    }
+    rows.push({ name: full, short: t ? t[1] : full, wins, losses, points: parseInt(p, 10) || 0, logo: img });
+  }
+  rows.sort((x, y) => y.wins - x.wins || y.points - x.points || x.name.localeCompare(y.name));
+  rows.forEach((x, i) => { x.seed = i + 1; });
+  standCache = { at: Date.now(), data: rows };
+  return rows;
+}
+app.get('/standings', needKey, async (req, res) => {
+  try { if (req.query.refresh === '1') standCache.at = 0; res.json({ rows: await loadStandings() }); }
+  catch (e) { console.error('Standings:', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ---------- casting mod: only MMM Officials can get it, and it is never a file you can copy ----------
 // Attach MMMOfficialCastingMod.dll to the GitHub release. The app asks for it here; the bot checks the Discord role first.
 async function requireOfficial(req, res) {
