@@ -1,6 +1,7 @@
 require('dotenv').config();
 const crypto = require('crypto');
 const { Readable } = require('stream');
+const audio = require('./audio');
 const { joinVoiceChannel, entersState, VoiceConnectionStatus } = require('@discordjs/voice');
 const fs = require('fs');
 const path = require('path');
@@ -88,6 +89,7 @@ async function connectVoice(guild, ch) {
   try {
     conn = joinVoiceChannel({ channelId: ch.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: false, selfMute: true });
     await entersState(conn, VoiceConnectionStatus.Ready, 8000);
+    audio.start(conn, client.user.id); // listens to each commentator separately (for the on-stream audio mix)
     conn.receiver.speaking.on('start', (id) => speaking.add(id));
     conn.receiver.speaking.on('end', (id) => speaking.delete(id));
     vcConn = conn;
@@ -107,6 +109,7 @@ app.post('/vc/join', needKey, async (req, res) => {
     const guild = await client.guilds.fetch(GUILD_ID);
     const ch = guild.voiceStates.cache.get(uid)?.channel;
     if (!ch) return res.status(400).json({ error: 'Join a voice channel in Discord first.' });
+    audio.stop();
     if (vcConn) { try { vcConn.destroy(); } catch {} vcConn = null; }
     speaking.clear();
     const mode = await connectVoice(guild, ch);
@@ -118,11 +121,19 @@ app.post('/vc/join', needKey, async (req, res) => {
 app.post('/vc/leave', needKey, async (req, res) => {
   try {
     if (vcChannel && String(req.body.userId) === vcOwner) {
+      audio.stop();
       if (vcConn) { try { vcConn.destroy(); } catch {} vcConn = null; }
       else sendVoiceState(await client.guilds.fetch(GUILD_ID), null);
       speaking.clear(); vcOwner = null; vcChannel = null;
     }
   } catch (e) { console.error(e); }
+  res.json({ ok: true });
+});
+
+// which commentators are heard on the stream (the Match Timer sends the full list of people who are switched OFF)
+app.post('/vc/audio/mute', needKey, (req, res) => {
+  if (String(req.body.userId) !== vcOwner) return res.status(403).json({ error: 'Not your voice session.' });
+  audio.setMuted(req.body.muted);
   res.json({ ok: true });
 });
 
@@ -397,31 +408,51 @@ app.get('/teams', needKey, async (req, res) => {
 });
 client.on('roleDelete', () => { teamCache.at = 0; getTeams(true).catch(() => {}); }); // a team role was deleted: re-check right away
 
-// ---------- standings (another tab of your Google Sheet) ----------
-// Columns: A team (full or short name) | B wins | C losses | D total points | E logo image URL (optional; falls back to the team role's icon)
-// Seed = rank by wins, then total points. Set STANDINGS_SHEET_GID to that tab's gid. The sheet must be "Anyone with the link can view".
+// ---------- standings ----------
+// W / L / total points come from a Discord channel (STANDINGS_CHANNEL_ID). One line per team, newest line wins, e.g.:
+//     Pure 1-1- +2 Diff        ->  Pure: 1 win, 1 loss, +2 = 2 total points
+// Logos: an optional sheet tab (STANDINGS_SHEET_GID, column A team, column E logo image URL), else the team role's icon, else initials.
+// Seed = rank by wins, then total points. Teams with no line yet show 0-0.
 let standCache = { at: 0, data: null };
-async function loadStandings() {
-  if (standCache.data && Date.now() - standCache.at < 60000) return standCache.data;
+async function channelStandings() {
+  const ch = await client.channels.fetch(process.env.STANDINGS_CHANNEL_ID).catch(() => null);
+  if (!ch?.messages) throw new Error('The standings channel was not found (check STANDINGS_CHANNEL_ID and that the bot can read it).');
+  const msgs = await ch.messages.fetch({ limit: 50 }); // newest first
+  const seen = new Map();
+  for (const m of msgs.values()) {
+    const embeds = m.embeds.map(e => [e.title, e.description, ...(e.fields || []).map(f => `${f.name}: ${f.value}`)].filter(Boolean).join('\n')).join('\n');
+    for (const raw of `${m.cleanContent}\n${embeds}`.split(/\r?\n/)) {
+      const line = raw.replace(/[*_`~|>]/g, '').replace(/^[^\p{L}\p{N}]+/u, '').trim();
+      const mm = line.match(/^(?:\d+[.)]\s*)?(.+?)\s+(\d+)\s*-\s*(\d+)(?:-(?=[\s+\-\d]))?\s*([+-]?\d+)\s*(?:diff|pts|points)?\s*$/i);
+      if (!mm) continue;
+      const full = canonTeam(mm[1].trim()), key = normKey(full);
+      if (!seen.has(key)) seen.set(key, { name: full, wins: Number(mm[2]), losses: Number(mm[3]), points: Number(mm[4]) });
+    }
+  }
+  return [...seen.values()];
+}
+async function sheetLogos() {
   const gid = process.env.STANDINGS_SHEET_GID;
-  if (!gid) throw new Error('STANDINGS_SHEET_GID is not set on the bot (the sheet tab with Team, Wins, Losses, Points, Logo).');
+  if (!gid) return new Map();
   const id = process.env.STANDINGS_SHEET_ID || process.env.TEAMS_SHEET_ID || '1aSA3Etwlnjt_33G7Dn_356YcCmRuC8za9uI8PGvLgBw';
   const r = await fetch(`https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`, { signal: AbortSignal.timeout(8000) });
   const text = await r.text();
-  if (!r.ok || /^\s*</.test(text)) throw new Error('the standings sheet is not shared publicly (set it to "Anyone with the link can view")');
+  if (!r.ok || /^\s*</.test(text)) throw new Error('the standings sheet is not shared publicly');
+  const m = new Map();
+  for (const row of parseCsv(text)) { const img = String(row[4] || '').trim(); if (row[0] && /^https?:\/\//i.test(img)) m.set(normKey(canonTeam(row[0].trim())), img); }
+  return m;
+}
+async function loadStandings() {
+  if (standCache.data && Date.now() - standCache.at < 60000) return standCache.data;
+  if (!process.env.STANDINGS_CHANNEL_ID) throw new Error('STANDINGS_CHANNEL_ID is not set on the bot (the channel with lines like "Pure 1-1- +2 Diff").');
   const guild = await client.guilds.fetch(GUILD_ID); await guild.roles.fetch();
-  const rows = [];
-  for (const [a, w, l, p, logo] of parseCsv(text)) {
-    const wins = parseInt(w, 10), losses = parseInt(l, 10);
-    if (!a || Number.isNaN(wins) || Number.isNaN(losses)) continue; // skips the header row
-    const full = canonTeam(a.trim()), t = TEAMS.find(([f]) => f === full);
-    let img = String(logo || '').trim(); if (!/^https?:\/\//i.test(img)) img = null;
-    if (!img) {
-      const role = guild.roles.cache.find(x => normKey(x.name) === normKey(full) || (t && normKey(x.name) === normKey(t[1])));
-      img = role?.iconURL({ extension: 'png', size: 128 }) || null;
-    }
-    rows.push({ name: full, short: t ? t[1] : full, wins, losses, points: parseInt(p, 10) || 0, logo: img });
-  }
+  const logos = await sheetLogos().catch(e => { console.error('Standings logos:', e.message); return new Map(); });
+  const got = new Map((await channelStandings()).map(r => [normKey(r.name), r]));
+  const rows = TEAMS.map(([name, short]) => {
+    const r = got.get(normKey(name)) || { wins: 0, losses: 0, points: 0 };
+    const role = guild.roles.cache.find(x => [normKey(name), normKey(short)].includes(normKey(x.name)));
+    return { name, short, wins: r.wins, losses: r.losses, points: r.points, logo: logos.get(normKey(name)) || role?.iconURL({ extension: 'png', size: 128 }) || null };
+  });
   rows.sort((x, y) => y.wins - x.wins || y.points - x.points || x.name.localeCompare(y.name));
   rows.forEach((x, i) => { x.seed = i + 1; });
   standCache = { at: Date.now(), data: rows };
@@ -483,6 +514,7 @@ client.once('ready', async () => {
   try { await (await client.guilds.fetch(GUILD_ID)).commands.set([lineUpCommand.toJSON()]); console.log('Slash command /line-up registered'); }
   catch (e) { console.error('Could not register /line-up:', e.message); }
   getTeams(true).catch((e) => console.error('Teams:', e.message)); setInterval(() => getTeams(true).catch(() => {}), 10 * 60 * 1000);
-  app.listen(PORT, () => console.log(`API on :${PORT}`));
+  const server = app.listen(PORT, () => console.log(`API on :${PORT}`));
+  audio.attach(server, (req, u) => req.headers['x-api-key'] === BOT_API_KEY && u.searchParams.get('userId') === vcOwner);
 });
 client.login(DISCORD_TOKEN);
