@@ -1,3 +1,6 @@
+// Commentator audio: the bot listens to each person in the voice channel SEPARATELY, mixes only the people who are switched on,
+// and streams that mix (as small Opus packets) to the caster's Match Timer. OBS captures the Match Timer with
+// "Application Audio Capture", so anyone switched off stops reaching the stream while they can still talk in Discord.
 const OpusScript = require('opusscript');
 const { EndBehaviorType } = require('@discordjs/voice');
 const { WebSocketServer } = require('ws');
