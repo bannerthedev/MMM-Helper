@@ -253,9 +253,10 @@ app.get('/update/latest', needKey, async (req, res) => {
 app.get('/update/download', needKey, async (req, res) => {
   try {
     const { assets } = await latestRelease();
-    const want = req.query.file === 'timer' ? /matchtimer/i : /officialapp/i;
-    const asset = assets.find(a => /\.exe$/i.test(a.name) && want.test(a.name));
-    if (!asset) return res.status(404).json({ error: `The latest release has no ${req.query.file === 'timer' ? 'MMMMatchTimer.exe' : 'MMMOfficialApp.exe'} attached.` });
+    const f = req.query.file;
+    const asset = f === 'assets' ? assets.find(a => /sceneassets.*\.zip$/i.test(a.name))
+      : assets.find(a => /\.exe$/i.test(a.name) && (f === 'timer' ? /matchtimer/i : /officialapp/i).test(a.name));
+    if (!asset) return res.status(404).json({ error: `The latest release has no ${f === 'assets' ? 'MMMSceneAssets.zip' : f === 'timer' ? 'MMMMatchTimer.exe' : 'MMMOfficialApp.exe'} attached.` });
     const r = await fetch(asset.url, { headers: ghHeaders('application/octet-stream'), redirect: 'follow' });
     if (!r.ok) return res.status(500).json({ error: `Could not download the update (${r.status}).` });
     res.setHeader('Content-Type', 'application/octet-stream');
@@ -328,7 +329,7 @@ client.on('interactionCreate', async (i) => {
 // ---------- teams: names, colors (Google Sheet) and Discord role tracking ----------
 // [full name, short name]. The bot understands BOTH everywhere (sheet rows, role names, the assignments channel).
 const TEAMS = [
-  ['ACID', 'ACID'], ['Get Hawked', 'GH'], ['Party Hat Pirates', 'PHP'], ['Cursed Kats', 'CK'], ['FEAR', 'FEAR'], ['Ruthless', 'RL'],
+  ['ACID', 'ACID'], ['Get Hawked', 'HAWKED'], ['Party Hat Pirates', 'PHP'], ['Cursed Kats', 'CK'], ['FEAR', 'FEAR'], ['Ruthless', 'RL'],
   ['Dare Devil', 'DD'], ['HOP', 'HOP'], ['Killer Dolphin', 'KD'], ['Yacer Yacer Yacer', 'YYY'], ['Faithfull Monkeys', 'FM'],
   ['Electronic Tree Troopers', 'ETT'], ['Angry Monkes', 'AM'], ['The European Monkeys', 'TEM'], ['Energy', 'NRG'], ['Zodiac', 'ZODI'],
   ['Zero Tolerance', 'ZT'], ['Gelato', 'GATO'], ['Suppression', 'SUP'], ['Overly Competitive Monkeys', 'OCM'], ['Speedy Monkeys Jay', 'SMJ'],
@@ -431,6 +432,41 @@ async function channelStandings() {
   }
   return [...seen.values()];
 }
+// W/L come from the scores channel: every message is one match like "Pure 3-2 Energy" / "Pure 3 - 2 Energy" / "Pure vs Energy 3-2".
+// The team with the higher score gets the win, the other the loss. Falls back to the standings channel's W-L if nothing is readable.
+const SCORES_CHANNEL = () => process.env.SCORES_CHANNEL_ID || '1475485766850449489';
+async function channelScores() {
+  const ch = await client.channels.fetch(SCORES_CHANNEL()).catch(() => null);
+  if (!ch?.messages) throw new Error('The scores channel was not found (check SCORES_CHANNEL_ID and that the bot can read it).');
+  const res = new Map(); let unread = 0, matches = 0;
+  let before;
+  for (let page = 0; page < 5; page++) { // up to 500 messages
+    const msgs = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+    if (!msgs.size) break;
+    before = msgs.last().id;
+    for (const m of msgs.values()) {
+      const embeds = m.embeds.map(e => [e.title, e.description, ...(e.fields || []).map(f => `${f.name} ${f.value}`)].filter(Boolean).join('\n')).join('\n');
+      const text = `${m.cleanContent}\n${embeds}`.replace(/[*_`~|>]/g, '');
+      let hit = false;
+      for (const raw of text.split(/\r?\n/)) {
+        const line = raw.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+        let a, b, sa, sb, mm;
+        if ((mm = line.match(/^(.+?)\s+(\d+)\s*(?:-|–|:|to)\s*(\d+)\s+(.+?)$/i))) { a = mm[1]; sa = +mm[2]; sb = +mm[3]; b = mm[4]; }
+        else if ((mm = line.match(/^(.+?)\s+(?:vs\.?|v)\s+(.+?)[\s:,-]+(\d+)\s*(?:-|–|:|to)\s*(\d+)\s*$/i))) { a = mm[1]; b = mm[2]; sa = +mm[3]; sb = +mm[4]; }
+        if (!a) continue;
+        const ta = canonTeam(a.replace(/^.*?:\s*/, '').trim()), tb = canonTeam(b.trim());
+        if (!TEAMS.some(([n]) => normKey(n) === normKey(ta)) || !TEAMS.some(([n]) => normKey(n) === normKey(tb)) || sa === sb) continue;
+        const [w, l] = sa > sb ? [ta, tb] : [tb, ta];
+        for (const [n, k] of [[w, 'wins'], [l, 'losses']]) { const r = res.get(normKey(n)) || { wins: 0, losses: 0 }; r[k]++; res.set(normKey(n), r); }
+        hit = true; matches++; break; // one match per message
+      }
+      if (!hit && text.trim()) unread++;
+    }
+    if (msgs.size < 100) break;
+  }
+  console.log(`Scores channel: ${matches} matches read, ${unread} messages not understood`);
+  return res;
+}
 async function sheetLogos() {
   const gid = process.env.STANDINGS_SHEET_GID;
   if (!gid) return new Map();
@@ -448,8 +484,11 @@ async function loadStandings() {
   const guild = await client.guilds.fetch(GUILD_ID); await guild.roles.fetch();
   const logos = await sheetLogos().catch(e => { console.error('Standings logos:', e.message); return new Map(); });
   const got = new Map((await channelStandings()).map(r => [normKey(r.name), r]));
+  const scores = await channelScores().catch(e => { console.error('Scores:', e.message); return new Map(); });
   const rows = TEAMS.map(([name, short]) => {
-    const r = got.get(normKey(name)) || { wins: 0, losses: 0, points: 0 };
+    const g = got.get(normKey(name)) || { wins: 0, losses: 0, points: 0 };
+    const sc = scores.size ? (scores.get(normKey(name)) || { wins: 0, losses: 0 }) : g; // scores channel wins when it has anything readable
+    const r = { wins: sc.wins, losses: sc.losses, points: g.points };
     const role = guild.roles.cache.find(x => [normKey(name), normKey(short)].includes(normKey(x.name)));
     return { name, short, wins: r.wins, losses: r.losses, points: r.points, logo: logos.get(normKey(name)) || role?.iconURL({ extension: 'png', size: 128 }) || null };
   });
