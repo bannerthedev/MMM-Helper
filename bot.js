@@ -605,6 +605,7 @@ async function requireOfficial(req, res) {
   const guild = await client.guilds.fetch(GUILD_ID);
   const member = uid ? await guild.members.fetch(uid).catch(() => null) : null;
   if (!member || !hasRole(member, [...CASTER, ...COMMENTATOR])) { res.status(403).json({ error: 'The casting mod is only for MMM Officials.' }); return null; }
+  if (process.env.MOD_PUBLIC !== '1' && uid !== (process.env.APP_MESSAGE_OWNER_ID || '1101643714033623120')) { res.status(403).json({ error: 'The casting mod is Coming Soon.' }); return null; } // owner only until MOD_PUBLIC=1
   return member;
 }
 app.get('/mod/payload', needKey, async (req, res) => {
