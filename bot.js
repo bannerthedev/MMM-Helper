@@ -6,7 +6,7 @@ const { joinVoiceChannel, entersState, VoiceConnectionStatus } = require('@disco
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
-const { Client, GatewayIntentBits, SlashCommandBuilder, MessageFlags } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, MessageFlags, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } = require('discord.js');
 const { parseMatchText, extractTimes } = require('./matchParser');
 
 const { DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, GUILD_ID, BOT_API_KEY, PORT = 3000 } = process.env;
@@ -502,6 +502,79 @@ app.get('/standings', needKey, async (req, res) => {
   catch (e) { console.error('Standings:', e.message); res.status(500).json({ error: e.message }); }
 });
 
+
+// ---------- /send-app-message: posts the MMM Officials App announcement + a one-time download button ----------
+// Only APP_MESSAGE_OWNER_ID (Banner) can run it. APP_MESSAGE_CHANNEL_ID is where it posts (or pick a channel in the command).
+const APP_OWNER = process.env.APP_MESSAGE_OWNER_ID || '1101643714033623120';
+const APP_COLOR = 0x00b0fc;
+const DL_ROLES = ['caster', 'head caster', 'commentator', 'head commentator'];
+const PUBLIC_URL = (process.env.PUBLIC_URL || 'https://mmm-helper-production.up.railway.app').replace(/\/+$/, '');
+const dlTokens = new Map(); // token -> { uid, expires }
+const roleIdByName = (n) => (ROLES.find(([name]) => name.toLowerCase() === n) || [])[1];
+const sendAppCommand = new SlashCommandBuilder().setName('send-app-message').setDescription('Post the MMM Officials App announcement')
+  .addChannelOption(o => o.setName('channel').setDescription('Channel to post in (default: APP_MESSAGE_CHANNEL_ID)').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
+  .setDefaultMemberPermissions('0'); // hidden from everyone except server admins; the bot also checks the user ID
+
+client.on('interactionCreate', async (i) => {
+  try {
+    if (i.isChatInputCommand() && i.commandName === 'send-app-message') {
+      if (i.user.id !== APP_OWNER) return i.reply({ content: 'You can’t use this command.', flags: MessageFlags.Ephemeral });
+      const ch = i.options.getChannel('channel') || (process.env.APP_MESSAGE_CHANNEL_ID ? await client.channels.fetch(process.env.APP_MESSAGE_CHANNEL_ID).catch(() => null) : null);
+      if (!ch?.send) return i.reply({ content: 'Pick a channel in the command, or set APP_MESSAGE_CHANNEL_ID on the bot.', flags: MessageFlags.Ephemeral });
+      const pingIds = ['head caster', 'caster', 'head commentator', 'commentator'].map(roleIdByName).filter(Boolean);
+      const pings = pingIds.map(r => `<@&${r}>`).join(' ');
+      const main = new EmbedBuilder().setColor(APP_COLOR).setDescription(
+`# <:MMMSZN11:1575380922537214042>  MMMOFFICIALS APP
+${pings || '@Head Caster @Caster @Head Commentator @Commentator'}
+
+We’re introducing the MMMOfficials App! This app includes the tools and resources you need as a MMM official, whether you're a caster, or commentator.
+
+## 📌 WHAT YOU NEED TO KNOW
+• The app includes everything you need for your role as a MMM official
+• CASTERS: This app is REQUIRED. You must have it installed, as this is where you will load the OBS Scenes for casting
+• The app is currently available as a .exe for Windows ONLY
+• Support for other operating systems may come in the future
+
+## 📥 HOW TO DOWNLOAD
+Click the button in the message below to receive a link to download the MMM Officials App.
+
+If you're a caster, make sure to download and set up the app before your next cast. All casters are expected to have it ready to use!`);
+      const dl = new EmbedBuilder().setColor(APP_COLOR).setDescription(
+`## 📥 MMM Officials App
+Click below to get a one-time download link. Requires Caster, Commentator, Referee, Board, or Directorate.`);
+      const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('dl_app').setLabel('Click to download Official App').setStyle(ButtonStyle.Primary));
+      await ch.send({ content: pings || undefined, embeds: [main, dl], components: [row], allowedMentions: { roles: pingIds } });
+      return i.reply({ content: `Posted in <#${ch.id}>.`, flags: MessageFlags.Ephemeral });
+    }
+    if (i.isButton() && i.customId === 'dl_app') {
+      const names = new Set([...rolesOf(i.member), ...i.member.roles.cache.map(r => r.name.trim())].map(x => x.toLowerCase()));
+      if (!DL_ROLES.some(r => names.has(r))) return i.reply({ content: 'The app is only for Casters, Head Casters, Commentators and Head Commentators.', flags: MessageFlags.Ephemeral });
+      for (const [k, v] of dlTokens) if (v.expires < Date.now()) dlTokens.delete(k);
+      const token = crypto.randomBytes(24).toString('hex');
+      dlTokens.set(token, { uid: i.user.id, expires: Date.now() + 10 * 60 * 1000 });
+      console.log(`App download link made for ${i.user.tag}`);
+      return i.reply({ content: 'Here is your one-time download link (it works once and expires in 10 minutes):', flags: MessageFlags.Ephemeral,
+        components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('Download MMMOfficialApp.exe').setStyle(ButtonStyle.Link).setURL(`${PUBLIC_URL}/dl/${token}`))] });
+    }
+  } catch (e) { console.error('send-app-message:', e.message); }
+});
+app.get('/dl/:token', async (req, res) => {
+  const t = dlTokens.get(req.params.token);
+  if (!t || t.expires < Date.now()) return res.status(410).send('This download link was already used or has expired. Click the button in Discord again to get a new one.');
+  dlTokens.delete(req.params.token); // one time only
+  try {
+    const { assets } = await latestRelease();
+    const asset = assets.find(a => /\.exe$/i.test(a.name) && /officialapp/i.test(a.name));
+    if (!asset) return res.status(404).send('The app is not available yet.');
+    const r = await fetch(asset.url, { headers: ghHeaders('application/octet-stream'), redirect: 'follow' });
+    if (!r.ok) return res.status(500).send('Could not download the app. Try again.');
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', 'attachment; filename="MMMOfficialApp.exe"');
+    if (asset.size) res.setHeader('Content-Length', asset.size);
+    Readable.fromWeb(r.body).pipe(res);
+  } catch (e) { if (!res.headersSent) res.status(500).send('Download failed.'); }
+});
+
 // ---------- casting mod: only MMM Officials can get it, and it is never a file you can copy ----------
 // Attach MMMOfficialCastingMod.dll to the GitHub release. The app asks for it here; the bot checks the Discord role first.
 async function requireOfficial(req, res) {
@@ -550,7 +623,7 @@ app.post('/preset/set', needKey, async (req, res) => {
 client.once('ready', async () => {
   console.log(`Bot online as ${client.user.tag}`);
   console.log(`Google config: client id starts ${envClean('GOOGLE_CLIENT_ID').slice(0, 12)}... | secret length ${envClean('GOOGLE_CLIENT_SECRET').length} | refresh token length ${refreshTokenClean().length} (starts "${refreshTokenClean().slice(0, 4)}")`);
-  try { await (await client.guilds.fetch(GUILD_ID)).commands.set([lineUpCommand.toJSON()]); console.log('Slash command /line-up registered'); }
+  try { await (await client.guilds.fetch(GUILD_ID)).commands.set([lineUpCommand.toJSON(), sendAppCommand.toJSON()]); console.log('Slash commands registered: /line-up, /send-app-message'); }
   catch (e) { console.error('Could not register /line-up:', e.message); }
   getTeams(true).catch((e) => console.error('Teams:', e.message)); setInterval(() => getTeams(true).catch(() => {}), 10 * 60 * 1000);
   const server = app.listen(PORT, () => console.log(`API on :${PORT}`));
