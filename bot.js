@@ -561,18 +561,21 @@ Click below to get a one-time download link. Requires Caster, Commentator, Refer
 app.get('/dl/:token', async (req, res) => {
   const t = dlTokens.get(req.params.token);
   if (!t || t.expires < Date.now()) return res.status(410).send('This download link was already used or has expired. Click the button in Discord again to get a new one.');
-  dlTokens.delete(req.params.token); // one time only
+  if (req.method === 'HEAD') return res.status(200).end(); // link previews / scanners must not use up the link
   try {
     const { assets } = await latestRelease();
     const asset = assets.find(a => /\.exe$/i.test(a.name) && /officialapp/i.test(a.name));
-    if (!asset) return res.status(404).send('The app is not available yet.');
+    if (!asset) { console.error('/dl: latest release has no MMMOfficialApp.exe'); return res.status(404).send('The app is not available yet: the latest release has no MMMOfficialApp.exe attached.'); }
     const r = await fetch(asset.url, { headers: ghHeaders('application/octet-stream'), redirect: 'follow' });
-    if (!r.ok) return res.status(500).send('Could not download the app. Try again.');
+    if (!r.ok) { console.error('/dl: GitHub answered', r.status); return res.status(500).send(`Could not download the app (GitHub said ${r.status}). Tell Banner.`); }
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', 'attachment; filename="MMMOfficialApp.exe"');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Encoding', 'identity');
     if (asset.size) res.setHeader('Content-Length', asset.size);
-    Readable.fromWeb(r.body).pipe(res);
-  } catch (e) { if (!res.headersSent) res.status(500).send('Download failed.'); }
+    res.on('finish', () => dlTokens.delete(req.params.token)); // the link is used up only once the whole file was sent
+    Readable.fromWeb(r.body).on('error', e => { console.error('/dl stream:', e.message); res.destroy(); }).pipe(res);
+  } catch (e) { console.error('/dl:', e.message); if (!res.headersSent) res.status(500).send('Download failed: ' + e.message); }
 });
 
 // ---------- casting mod: only MMM Officials can get it, and it is never a file you can copy ----------
