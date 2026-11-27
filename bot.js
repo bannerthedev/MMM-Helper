@@ -558,6 +558,12 @@ Click below to get a one-time download link. Requires Caster, Commentator, Refer
     }
   } catch (e) { console.error('send-app-message:', e.message); }
 });
+
+// ---------- public pages (Google asks for a homepage + privacy policy URL before an app can go "In production") ----------
+const pageHtml = (title, body) => `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><body style="font-family:Segoe UI,Arial,sans-serif;background:#080c14;color:#e8eefc;max-width:720px;margin:60px auto;padding:0 20px;line-height:1.6"><h1 style="color:#00b0fc">${title}</h1>${body}</body>`;
+app.get('/', (req, res) => res.type('html').send(pageHtml('MMM Official App', '<p>The MMM Official App is a tool for officials (casters and commentators) of the Monke Monke Monke League, a Gorilla Tag league. It helps set up broadcasts, including creating the league\'s YouTube live stream.</p><p>Discord: <a style="color:#00b0fc" href="https://discord.gg/mmml">discord.gg/mmml</a> &middot; <a style="color:#00b0fc" href="/privacy">Privacy Policy</a></p>')));
+app.get('/privacy', (req, res) => res.type('html').send(pageHtml('Privacy Policy', '<p>Last updated: November 2026.</p><p>The MMM Official App is used only by officials of the Monke Monke Monke League.</p><h3>What we use</h3><ul><li><b>Discord:</b> your Discord user ID, display name, avatar and server roles, to sign you in and show the right tools.</li><li><b>YouTube:</b> the league\'s own YouTube account is connected once by the league owner. The app uses it only to create and update the league\'s live broadcasts (title, description, thumbnail). It does not read or store the personal data of viewers.</li></ul><h3>What we do not do</h3><p>We do not sell or share your data, and we do not use Google user data for advertising. Data is kept only as long as needed to run the league\'s broadcasts.</p><h3>Contact</h3><p>Questions or removal requests: message the league owner on Discord at <a style="color:#00b0fc" href="https://discord.gg/mmml">discord.gg/mmml</a>.</p>')));
+
 // The link opens a small page that stays open (so you can SEE what happened) and starts the download from /dl/<code>/file
 app.get('/dl/:token', (req, res) => {
   const ok = dlTokens.get(req.params.token)?.expires > Date.now();
