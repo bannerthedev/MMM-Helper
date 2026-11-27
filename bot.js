@@ -558,7 +558,17 @@ Click below to get a one-time download link. Requires Caster, Commentator, Refer
     }
   } catch (e) { console.error('send-app-message:', e.message); }
 });
-app.get('/dl/:token', async (req, res) => {
+// The link opens a small page that stays open (so you can SEE what happened) and starts the download from /dl/<code>/file
+app.get('/dl/:token', (req, res) => {
+  const ok = dlTokens.get(req.params.token)?.expires > Date.now();
+  console.log(`/dl page opened (${req.method}) - link ${ok ? 'valid' : 'invalid or used'}`);
+  res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.setHeader('Cache-Control', 'no-store');
+  if (!ok) return res.status(410).send('<body style="font-family:sans-serif;background:#080c14;color:#fff;text-align:center;padding-top:80px"><h2>This download link was already used or has expired.</h2><p>Click the button in Discord again to get a new one.</p></body>');
+  const f = `/dl/${req.params.token}/file`;
+  res.send(`<body style="font-family:sans-serif;background:#080c14;color:#fff;text-align:center;padding-top:80px"><h2>Your MMM Officials App download is starting…</h2><p>If nothing happens in a few seconds, <a style="color:#00b0fc" href="${f}">click here to download MMMOfficialApp.exe</a>.</p><p style="opacity:.6">If your browser says the file is not commonly downloaded, choose Keep. You can close this tab afterwards.</p><script>setTimeout(function(){location.href='${f}'},800)</script></body>`);
+});
+app.get('/dl/:token/file', async (req, res) => {
+  console.log(`/dl file requested (${req.method})`);
   const t = dlTokens.get(req.params.token);
   if (!t || t.expires < Date.now()) return res.status(410).send('This download link was already used or has expired. Click the button in Discord again to get a new one.');
   if (req.method === 'HEAD') return res.status(200).end(); // link previews / scanners must not use up the link
@@ -566,7 +576,11 @@ app.get('/dl/:token', async (req, res) => {
     const { assets } = await latestRelease();
     const asset = assets.find(a => /\.exe$/i.test(a.name) && /officialapp/i.test(a.name));
     if (!asset) { console.error('/dl: latest release has no MMMOfficialApp.exe'); return res.status(404).send('The app is not available yet: the latest release has no MMMOfficialApp.exe attached.'); }
-    const r = await fetch(asset.url, { headers: ghHeaders('application/octet-stream'), redirect: 'follow' });
+    // GitHub answers with a short-lived signed link to the file: send the browser straight there, so the 60+ MB never has to pass through Railway
+    const first = await fetch(asset.url, { headers: ghHeaders('application/octet-stream'), redirect: 'manual' });
+    const loc = first.headers.get('location');
+    if (first.status >= 300 && first.status < 400 && loc) { dlTokens.delete(req.params.token); console.log('/dl: redirecting to the release file'); return res.redirect(302, loc); }
+    const r = first.ok ? first : await fetch(asset.url, { headers: ghHeaders('application/octet-stream'), redirect: 'follow' });
     if (!r.ok) { console.error('/dl: GitHub answered', r.status); return res.status(500).send(`Could not download the app (GitHub said ${r.status}). Tell Banner.`); }
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', 'attachment; filename="MMMOfficialApp.exe"');
